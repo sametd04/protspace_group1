@@ -42,7 +42,7 @@ def calculate_trustworthiness(
     except ValueError as e:
         import warnings
 
-        warnings.warn(f"Trustworthiness calculation failed: {e}")
+        warnings.warn(f"Trustworthiness calculation failed: {e}"), stacklevel = 2
         return float("nan")
 
 
