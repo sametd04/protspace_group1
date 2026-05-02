@@ -16,10 +16,11 @@
 !/data/3FTx
 !/data/Pla2g2
 !/data/toxins
-# Always ignore pdb subdirectories, tmp subdirectories, and .h5 files everywhere
+# Always ignore pdb subdirectories, tmp subdirectories, .h5 files, and generated projections
 **/pdb/
 **/tmp/
 **/*.h5
+**/*.npy
 
 # Python bytecode
 __pycache__/

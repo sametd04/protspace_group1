@@ -17,7 +17,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "src"))
 
 from protspace.benchmark import benchmark_methods
-from protspace.benchmark.metrics import calculate_trustworthiness
+from protspace.benchmark.metrics import calculate_trustworthiness, calculate_knn_preservation, calculate_continuity
 from protspace.data.loaders import load_h5
 from protspace.utils.constants import DimensionReductionConfig
 
@@ -56,6 +56,8 @@ def main():
     # Use only implemented metrics (avoid NotImplementedError)
     metric_functions = {
         "trustworthiness": calculate_trustworthiness,
+        "knn_preservation": calculate_knn_preservation,
+        "continuity": calculate_continuity,
     }
 
     print(f"Benchmarking methods: {', '.join(METHODS)}")
@@ -83,6 +85,7 @@ def main():
             for name, value in result.metrics.items():
                 if not np.isnan(value):
                     print(f"    {name}: {value:.6f}")
+
 
     # Save projections and metrics
     OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
