@@ -5,17 +5,25 @@ Benchmark dimensionality reduction (DR) methods on protein embeddings with timin
 ## Quick Start
 
 ```bash
-# Run benchmark on 3ftx dataset
-cd src/protspace/benchmark
-python run.py
+# From repo root (install plotting extra once)
+uv sync --extra benchmark
+
+# Run benchmark on 3ftx dataset + write projections_3ftx.png
+uv run python src/protspace/benchmark/run.py --plot
+
+# Re-render figure only (needs prior results + headers.npy or HDF5)
+uv run python src/protspace/benchmark/run.py --plot-only
+# equivalent:
+uv run python src/protspace/benchmark/visualize.py
 ```
 
 This will:
-- Load embeddings from `output_3ftx/tmp/prot_t5.h5`
-- Run PCA, UMAP, and t-SNE
-- Calculate trustworthiness metric
+- Load embeddings from `output_3ftx/tmp/prot_t5.h5` (full run only)
+- Run PCA, UMAP, t-SNE, PaCMAP, MDS, LocalMAP
+- Calculate trustworthiness and silhouette (when `data.parquetbundle` exists)
 - Save projections to `src/protspace/benchmark/results/3ftx/`
 - Save metrics to `metrics.csv`
+- With `--plot` or `--plot-only`, save `projections_3ftx.png`
 
 ## Python API
 
@@ -71,7 +79,7 @@ Import from `protspace.benchmark.metrics`:
 
 - `calculate_trustworthiness` - Local neighborhood preservation (k-NN based) ✓ **Implemented**
 - `calculate_continuity` - Placeholder (not implemented yet)
-- `calculate_silhouette_score` - Placeholder (not implemented yet)
+- `calculate_silhouette_score` / `make_silhouette_metric` - Silhouette on 2D projection with bundle labels ✓ **Implemented** (see ``run.py``)
 - `calculate_knn_preservation` - Placeholder (not implemented yet)
 
 All metrics in `AVAILABLE_METRICS` dictionary. Only use implemented metrics to avoid errors.
