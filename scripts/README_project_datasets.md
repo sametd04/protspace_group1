@@ -1,7 +1,7 @@
 # Project-Datasets: Download + erster Research-Workflow
 
 Diese Datei erklärt dir:
-1. wie du die 4 Projekt-Datasets herunterlädst,
+1. wie du die 5 Projekt-Datasets herunterlädst,
 2. wie du alles **klein** hältst (Default),
 3. was du konkret tun musst, um euer **erstes Research-Ziel** zu erreichen.
 
@@ -31,9 +31,9 @@ Schritte:
    ```bash
    uv run protspace embed -i data/project_datasets/3ftx/3ftx_reviewed.fasta -e prot_t5 -o output_3ftx/tmp
    ```
-3. **Benchmark auf 3FTx laufen lassen** (`run.py` auf `DATASET = "3ftx"`):
+3. **Benchmark auf 3FTx laufen lassen**:
    ```bash
-   uv run python src/protspace/benchmark/run.py
+   uv run python src/protspace/benchmark/run.py --dataset 3ftx
    ```
 4. **Ergebnisse prüfen**:
    - `src/protspace/benchmark/results/3ftx/metrics.csv`
@@ -55,10 +55,25 @@ Script:
 Default-Verhalten ist jetzt **klein/subset** (nicht full):
 - `3ftx`: max 300
 - `toxprot`: max 1500
+- `pla2g2`: max 1000
 - `cath_s40`: max 3000
 - `swissprot_rr` (reviewed): max 10000
 
 Damit bleibt der Download typischerweise im niedrigen bis mittleren zweistelligen MB-Bereich statt hunderten MB.
+
+Ordnerstruktur nach Download (Default):
+- `data/3ftx/`
+- `data/toxprot/`
+- `data/pla2g2/`
+- `data/cath_s40/`
+- `data/swissprot_rr/`
+
+Zusätzlich werden passende Output-Ordner angelegt:
+- `output_3ftx/`
+- `output_toxprot/`
+- `output_pla2g2/`
+- `output_cath_s40/`
+- `output_swissprot_rr/`
 
 ## 3) Download ausführen
 
@@ -67,9 +82,13 @@ Damit bleibt der Download typischerweise im niedrigen bis mittleren zweistellige
 uv run python scripts/download_project_datasets.py -v
 ```
 
+Dieser Befehl macht jetzt beides:
+- lädt die FASTA-Dateien in `data/<dataset>/`
+- erzeugt direkt `prot_t5.h5` in `output_<dataset>/tmp/`
+
 ### Nur einzelne Datasets
 ```bash
-uv run python scripts/download_project_datasets.py --datasets 3ftx toxprot -v
+uv run python scripts/download_project_datasets.py --datasets 3ftx toxprot pla2g2 -v
 ```
 
 ### Noch kleiner machen
@@ -77,6 +96,7 @@ uv run python scripts/download_project_datasets.py --datasets 3ftx toxprot -v
 uv run python scripts/download_project_datasets.py \
   --3ftx-max 150 \
   --toxprot-max 600 \
+  --pla2g2-max 400 \
   --cath-max 1200 \
   --swissprot-max 3000 \
   -v
@@ -87,35 +107,54 @@ uv run python scripts/download_project_datasets.py \
 uv run python scripts/download_project_datasets.py --full -v
 ```
 
-## 4) Embeddings erzeugen (für Benchmark `run.py`)
+Wenn du nur FASTA willst (ohne H5-Generierung):
+```bash
+uv run python scripts/download_project_datasets.py --no-embed-h5 -v
+```
+
+Dateigrößen + Anzahl anzeigen (FASTA + H5):
+```bash
+uv run python scripts/download_project_datasets.py --report-sizes
+```
+
+Nur Report anzeigen (ohne Download/Embedding):
+```bash
+uv run python scripts/download_project_datasets.py --report-only
+```
+
+## 4) H5-Dateien (für Benchmark `run.py`)
 
 `run.py` erwartet H5-Dateien unter:
 - `output_<dataset>/tmp/prot_t5.h5`
 
-Beispiel-Kommandos:
+Diese H5-Dateien werden standardmäßig schon beim Download erzeugt (`--embed-h5` ist default).
+
+Falls du H5 manuell erzeugen willst:
 
 ```bash
-uv run protspace embed -i data/project_datasets/3ftx/3ftx_reviewed.fasta -e prot_t5 -o output_3ftx/tmp
-uv run protspace embed -i data/project_datasets/toxprot/toxprot_reviewed.fasta -e prot_t5 -o output_toxprot/tmp
-uv run protspace embed -i data/project_datasets/cath_s40/cath_s40.fa -e prot_t5 -o output_cath_s40/tmp
-uv run protspace embed -i data/project_datasets/swissprot/swissprot_reviewed.fasta -e prot_t5 -o output_swissprot_rr/tmp
+uv run protspace embed -i data/3ftx/3ftx_reviewed.fasta -e prot_t5 -o output_3ftx/tmp
+uv run protspace embed -i data/toxprot/toxprot_reviewed.fasta -e prot_t5 -o output_toxprot/tmp
+uv run protspace embed -i data/pla2g2/pla2g2.fasta -e prot_t5 -o output_pla2g2/tmp
+uv run protspace embed -i data/cath_s40/cath_s40.fa -e prot_t5 -o output_cath_s40/tmp
+uv run protspace embed -i data/swissprot_rr/swissprot_reviewed.fasta -e prot_t5 -o output_swissprot_rr/tmp
 ```
 
 Wenn du SwissProt mit Redundanzreduktion erzeugt hast (`--swissprot-identity`), dann stattdessen:
 
 ```bash
-uv run protspace embed -i data/project_datasets/swissprot/swissprot_rr.fasta -e prot_t5 -o output_swissprot_rr/tmp
+uv run protspace embed -i data/swissprot_rr/swissprot_rr.fasta -e prot_t5 -o output_swissprot_rr/tmp
 ```
 
 ## 5) Benchmark für erstes Ziel laufen lassen
 
-In `src/protspace/benchmark/run.py`:
-- `DATASET = "3ftx"` (oder `toxprot`, `cath_s40`, `swissprot_rr`)
-- `EMBEDDING_MODEL = "prot_t5"`
-
-Dann:
+Ein Dataset wählen:
 ```bash
-uv run python src/protspace/benchmark/run.py
+uv run python src/protspace/benchmark/run.py --dataset 3ftx
+```
+
+Oder alle nacheinander benchmarken:
+```bash
+uv run python src/protspace/benchmark/run.py --all-datasets
 ```
 
 Outputs:

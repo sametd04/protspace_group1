@@ -43,24 +43,40 @@ def benchmark_paths(data: str | None = None) -> BenchmarkPaths:
     project_root = Path(__file__).resolve().parent.parent.parent.parent.parent
     out = Path(__file__).resolve().parent.parent / "results" / d
 
-    # Look for data in data/{dataset}/ directory
-    # Dataset name might be capitalized (e.g., 3FTx vs 3ftx)
+    output_dataset_dir = project_root / f"output_{d}"
+
+    # Look for data in data/{dataset}/ directory.
+    # Dataset name might be capitalized (e.g., 3FTx vs 3ftx).
     data_dir = project_root / "data"
-    dataset_dir = None
+    data_dataset_dir = None
 
     # Try exact match first, then case-insensitive
     if (data_dir / d).exists():
-        dataset_dir = data_dir / d
+        data_dataset_dir = data_dir / d
     else:
         # Try to find case-insensitive match
         for item in data_dir.iterdir():
             if item.is_dir() and item.name.lower() == d.lower():
-                dataset_dir = item
+                data_dataset_dir = item
                 break
 
-    # Fallback to output_{d} if data/{d} doesn't exist
-    if dataset_dir is None:
-        dataset_dir = project_root / f"output_{d}"
+    # Prefer location that actually contains embeddings, with output_<dataset>
+    # taking priority because this is where benchmark embedding generation writes.
+    output_embedding = output_dataset_dir / "tmp" / "prot_t5.h5"
+    data_embedding = (
+        data_dataset_dir / "tmp" / "prot_t5.h5" if data_dataset_dir is not None else None
+    )
+
+    if output_embedding.exists():
+        dataset_dir = output_dataset_dir
+    elif data_embedding is not None and data_embedding.exists():
+        dataset_dir = data_dataset_dir
+    elif output_dataset_dir.exists():
+        dataset_dir = output_dataset_dir
+    elif data_dataset_dir is not None:
+        dataset_dir = data_dataset_dir
+    else:
+        dataset_dir = output_dataset_dir
 
     # Look for bundle in parquetbundle subdirectory or directly
     bundle_path = None

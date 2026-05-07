@@ -13,6 +13,7 @@ For visualization, see visualize.py.
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import warnings
@@ -21,16 +22,16 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 
-# Suppress numerical precision warnings from sklearn
-warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn")
-
 from protspace.benchmark import benchmark_methods
-from protspace.benchmark.io import BenchmarkPaths
+from protspace.benchmark.io import BenchmarkPaths, benchmark_paths
 from protspace.benchmark.labels import label_summary, load_silhouette_labels
 from protspace.benchmark.metrics import default_metric_functions
 from protspace.data.io.bundle import write_bundle
 from protspace.data.loaders import load_h5
 from protspace.utils.constants import DimensionReductionConfig
+
+# Suppress numerical precision warnings from sklearn
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn")
 
 # Benchmark configuration
 METHODS = ["pca", "umap", "tsne", "pacmap", "mds", "localmap"]
@@ -44,6 +45,8 @@ METHOD_TITLES = {
     "mds": "MDS",
     "localmap": "LocalMAP",
 }
+DEFAULT_DATASET = "3ftx"
+DATASET_CHOICES = ("3ftx", "toxprot", "pla2g2", "cath_s40", "swissprot_rr")
 
 
 def run_benchmark(paths: BenchmarkPaths) -> None:
@@ -97,7 +100,7 @@ def run_benchmark(paths: BenchmarkPaths) -> None:
 
     # Run without normalization for comparison
     print("\nRunning without normalization for comparison...")
-    results_raw = benchmark_methods(
+    _results_raw = benchmark_methods(
         embeddings=embeddings,
         methods=METHODS,
         config=config,
@@ -216,3 +219,34 @@ def run_benchmark(paths: BenchmarkPaths) -> None:
     print(f"Metrics saved to {metrics_csv}")
     print(f"\nVisualize with: protspace serve {bundle_path}")
     print("=" * 70)
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run DR benchmark for one or multiple datasets."
+    )
+    parser.add_argument(
+        "--dataset",
+        default=DEFAULT_DATASET,
+        choices=DATASET_CHOICES,
+        help=f"Dataset to benchmark (default: {DEFAULT_DATASET}).",
+    )
+    parser.add_argument(
+        "--all-datasets",
+        action="store_true",
+        help="Run benchmark for all configured datasets sequentially.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
+    datasets = DATASET_CHOICES if args.all_datasets else (args.dataset,)
+    for index, dataset in enumerate(datasets):
+        if index > 0:
+            print("\n" + "#" * 90 + "\n")
+        run_benchmark(benchmark_paths(dataset))
+
+
+if __name__ == "__main__":
+    main()

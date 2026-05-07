@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Download project datasets (3FTx, ToxProt, CATH S40, SwissProt).
+"""Download project datasets (3FTx, ToxProt, Pla2g2, CATH S40, SwissProt).
 
 Usage examples:
     uv run python scripts/download_project_datasets.py
-    uv run python scripts/download_project_datasets.py --datasets toxprot cath_s40
+    uv run python scripts/download_project_datasets.py --datasets toxprot pla2g2 cath_s40
     uv run python scripts/download_project_datasets.py --toxprot-max 2000 --cath-max 5000
     uv run python scripts/download_project_datasets.py --swissprot-max 50000
+    uv run python scripts/download_project_datasets.py --no-embed-h5
+    uv run python scripts/download_project_datasets.py --report-sizes
+    uv run python scripts/download_project_datasets.py --report-only
     uv run python scripts/download_project_datasets.py --full
     uv run python scripts/download_project_datasets.py --swissprot-identity 0.4
 """
@@ -15,6 +18,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -24,6 +28,7 @@ from pathlib import Path
 import requests
 
 logger = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 UNIPROT_SEARCH_URL = "https://rest.uniprot.org/uniprotkb/search"
 CATH_S40_FASTA_URL = (
@@ -37,10 +42,14 @@ CATH_S40_LIST_URL = (
 THREE_FTX_CSV_URL = (
     "https://raw.githubusercontent.com/tsenoner/protspace/main/data/3FTx/3FTx.csv"
 )
-ALL_DATASETS = ("3ftx", "toxprot", "cath_s40", "swissprot_rr")
+PLA2G2_FASTA_URL = (
+    "https://raw.githubusercontent.com/tsenoner/protspace/main/data/Pla2g2/Pla2g2.fasta"
+)
+ALL_DATASETS = ("3ftx", "toxprot", "pla2g2", "cath_s40", "swissprot_rr")
 DEFAULT_SMALL_MAX = {
     "threeftx_max": 300,
     "toxprot_max": 1500,
+    "pla2g2_max": 1000,
     "cath_max": 3000,
     "swissprot_max": 10000,
 }
@@ -172,7 +181,7 @@ def _download_3ftx(
     dataset_dir.mkdir(parents=True, exist_ok=True)
 
     csv_path = dataset_dir / "3FTx.csv"
-    local_csv = Path("data/3FTx/3FTx.csv")
+    local_csv = PROJECT_ROOT / "data" / "3FTx" / "3FTx.csv"
     if local_csv.exists():
         shutil.copy2(local_csv, csv_path)
         logger.info("Copied local 3FTx CSV -> %s", csv_path)
@@ -219,6 +228,25 @@ def _download_toxprot(
         timeout=timeout,
     )
     logger.info("ToxProt FASTA saved: %s (%s sequences)", output_fasta, count)
+
+
+def _download_pla2g2(out_dir: Path, *, max_sequences: int | None, timeout: int) -> None:
+    dataset_dir = out_dir / "pla2g2"
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+
+    output_fasta = dataset_dir / "pla2g2.fasta"
+    local_fasta = PROJECT_ROOT / "data" / "Pla2g2" / "Pla2g2.fasta"
+    if local_fasta.exists():
+        shutil.copy2(local_fasta, output_fasta)
+        logger.info("Copied local Pla2g2 FASTA -> %s", output_fasta)
+    else:
+        _download_file(PLA2G2_FASTA_URL, output_fasta, timeout=timeout)
+
+    if max_sequences is not None:
+        trimmed = _trim_fasta(output_fasta, max_sequences)
+        logger.info("Pla2g2 FASTA trimmed to %s sequences", trimmed)
+    else:
+        logger.info("Pla2g2 FASTA sequences: %s", _count_fasta_sequences(output_fasta))
 
 
 def _download_cath_s40(
@@ -278,7 +306,7 @@ def _download_swissprot(
     batch_size: int,
     identity: float | None,
 ) -> None:
-    dataset_dir = out_dir / "swissprot"
+    dataset_dir = out_dir / "swissprot_rr"
     dataset_dir.mkdir(parents=True, exist_ok=True)
     full_fasta = dataset_dir / "swissprot_reviewed.fasta"
 
@@ -305,9 +333,140 @@ def _download_swissprot(
         )
 
 
+def _ensure_output_folders(datasets: Iterable[str]) -> None:
+    for dataset in datasets:
+        (PROJECT_ROOT / f"output_{dataset}" / "tmp").mkdir(parents=True, exist_ok=True)
+
+
+def _fasta_path_for_dataset(data_dir: Path, dataset: str) -> Path:
+    if dataset == "3ftx":
+        return data_dir / "3ftx" / "3ftx_reviewed.fasta"
+    if dataset == "toxprot":
+        return data_dir / "toxprot" / "toxprot_reviewed.fasta"
+    if dataset == "pla2g2":
+        return data_dir / "pla2g2" / "pla2g2.fasta"
+    if dataset == "cath_s40":
+        return data_dir / "cath_s40" / "cath_s40.fa"
+    if dataset == "swissprot_rr":
+        rr = data_dir / "swissprot_rr" / "swissprot_rr.fasta"
+        return rr if rr.exists() else data_dir / "swissprot_rr" / "swissprot_reviewed.fasta"
+    raise ValueError(f"Unsupported dataset: {dataset}")
+
+
+def _embed_dataset_h5(
+    data_dir: Path, dataset: str, embedder: str, batch_size: int
+) -> None:
+    fasta_path = _fasta_path_for_dataset(data_dir, dataset)
+    if not fasta_path.exists():
+        raise FileNotFoundError(
+            f"Missing FASTA for dataset '{dataset}': {fasta_path}"
+        )
+
+    output_tmp = PROJECT_ROOT / f"output_{dataset}" / "tmp"
+    output_tmp.mkdir(parents=True, exist_ok=True)
+
+    if shutil.which("uv"):
+        cmd = [
+            "uv",
+            "run",
+            "protspace",
+            "embed",
+            "-i",
+            str(fasta_path),
+            "-e",
+            embedder,
+            "-o",
+            str(output_tmp),
+            "--batch-size",
+            str(batch_size),
+        ]
+    else:
+        cmd = [
+            "protspace",
+            "embed",
+            "-i",
+            str(fasta_path),
+            "-e",
+            embedder,
+            "-o",
+            str(output_tmp),
+            "--batch-size",
+            str(batch_size),
+        ]
+
+    logger.info("Generating H5 for %s: %s", dataset, " ".join(cmd))
+    subprocess.run(cmd, check=True, cwd=PROJECT_ROOT, env=os.environ.copy())
+
+
+def _embed_all_selected(
+    data_dir: Path,
+    datasets: Iterable[str],
+    *,
+    embedder: str,
+    batch_size: int,
+) -> None:
+    for dataset in datasets:
+        _embed_dataset_h5(data_dir, dataset, embedder=embedder, batch_size=batch_size)
+
+
+def _human_size(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024.0 or unit == "TB":
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{num_bytes} B"
+
+
+def _count_h5_embeddings(h5_path: Path) -> int:
+    import h5py
+
+    count = 0
+
+    def _visit(_, obj):
+        nonlocal count
+        if isinstance(obj, h5py.Dataset):
+            count += 1
+
+    with h5py.File(h5_path, "r") as handle:
+        handle.visititems(_visit)
+    return count
+
+
+def report_dataset_file_sizes(
+    data_dir: Path, datasets: Iterable[str], embedder: str = "prot_t5"
+) -> None:
+    print("\nDataset file report")
+    print("=" * 94)
+    print(
+        f"{'dataset':<12} {'fasta':<42} {'fasta_size':>11} {'seqs':>8} "
+        f"{'h5_size':>11} {'h5_entries':>11}"
+    )
+    print("-" * 94)
+
+    for dataset in sorted(datasets):
+        fasta_path = _fasta_path_for_dataset(data_dir, dataset)
+        h5_path = PROJECT_ROOT / f"output_{dataset}" / "tmp" / f"{embedder}.h5"
+
+        fasta_rel = str(fasta_path.relative_to(PROJECT_ROOT)) if fasta_path.exists() else "-"
+        fasta_size = _human_size(fasta_path.stat().st_size) if fasta_path.exists() else "-"
+        fasta_count = str(_count_fasta_sequences(fasta_path)) if fasta_path.exists() else "-"
+
+        h5_size = _human_size(h5_path.stat().st_size) if h5_path.exists() else "-"
+        h5_count = str(_count_h5_embeddings(h5_path)) if h5_path.exists() else "-"
+
+        print(
+            f"{dataset:<12} {fasta_rel:<42} {fasta_size:>11} {fasta_count:>8} "
+            f"{h5_size:>11} {h5_count:>11}"
+        )
+    print("=" * 94)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Download project datasets (3FTx, ToxProt, CATH S40, SwissProt)."
+        description=(
+            "Download project datasets (3FTx, ToxProt, Pla2g2, CATH S40, SwissProt)."
+        )
     )
     parser.add_argument(
         "--datasets",
@@ -320,8 +479,8 @@ def main() -> None:
         "-o",
         "--output-dir",
         type=Path,
-        default=Path("data/project_datasets"),
-        help="Output directory (default: data/project_datasets).",
+        default=PROJECT_ROOT / "data",
+        help="Output directory (default: <repo>/data).",
     )
     parser.add_argument(
         "--batch-size",
@@ -358,6 +517,12 @@ def main() -> None:
         help=f"Max CATH S40 sequences (default: {DEFAULT_SMALL_MAX['cath_max']}).",
     )
     parser.add_argument(
+        "--pla2g2-max",
+        type=int,
+        default=DEFAULT_SMALL_MAX["pla2g2_max"],
+        help=f"Max Pla2g2 sequences (default: {DEFAULT_SMALL_MAX['pla2g2_max']}).",
+    )
+    parser.add_argument(
         "--swissprot-max",
         type=int,
         default=DEFAULT_SMALL_MAX["swissprot_max"],
@@ -380,12 +545,41 @@ def main() -> None:
         action="store_true",
         help="Disable subset limits and download full datasets.",
     )
+    parser.add_argument(
+        "--embed-h5",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also generate output_<dataset>/tmp/<embedder>.h5 (default: true).",
+    )
+    parser.add_argument(
+        "--embedder",
+        type=str,
+        default="prot_t5",
+        help="Embedder for H5 generation (default: prot_t5).",
+    )
+    parser.add_argument(
+        "--embed-batch-size",
+        type=int,
+        default=250,
+        help="Batch size for protspace embed (default: 250).",
+    )
+    parser.add_argument(
+        "--report-sizes",
+        action="store_true",
+        help="Print FASTA/H5 sizes and sequence/entry counts after running.",
+    )
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Only print FASTA/H5 report (skip download and embedding).",
+    )
     parser.add_argument("-v", "--verbose", action="count", default=0)
     args = parser.parse_args()
 
     if args.full:
         args.threeftx_max = None
         args.toxprot_max = None
+        args.pla2g2_max = None
         args.cath_max = None
         args.swissprot_max = None
 
@@ -398,6 +592,10 @@ def main() -> None:
 
     selected = set(ALL_DATASETS if "all" in args.datasets else args.datasets)
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.report_only:
+        report_dataset_file_sizes(args.output_dir, selected, embedder=args.embedder)
+        return
 
     if "3ftx" in selected:
         _download_3ftx(
@@ -412,6 +610,12 @@ def main() -> None:
             max_sequences=args.toxprot_max,
             timeout=args.timeout,
             batch_size=args.batch_size,
+        )
+    if "pla2g2" in selected:
+        _download_pla2g2(
+            args.output_dir,
+            max_sequences=args.pla2g2_max,
+            timeout=args.timeout,
         )
     if "cath_s40" in selected:
         _download_cath_s40(
@@ -428,6 +632,16 @@ def main() -> None:
             identity=args.swissprot_identity,
         )
 
+    _ensure_output_folders(selected)
+    if args.embed_h5:
+        _embed_all_selected(
+            args.output_dir,
+            sorted(selected),
+            embedder=args.embedder,
+            batch_size=args.embed_batch_size,
+        )
+    if args.report_sizes:
+        report_dataset_file_sizes(args.output_dir, selected, embedder=args.embedder)
     logger.warning("Done. Files written to: %s", args.output_dir)
 
 
