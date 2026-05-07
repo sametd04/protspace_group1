@@ -1,21 +1,26 @@
 # ProtSpace Benchmark Module
 
-Benchmark dimensionality reduction (DR) methods on protein embeddings with timing and quality metrics.
+Benchmark dimensionality reduction methods on protein embeddings with timing and quality metrics.
 
 ## Quick Start
 
 ```bash
-# Run benchmark on 3ftx dataset
-cd src/protspace/benchmark
-python run.py
+# Install dependencies
+uv sync --extra benchmark
+
+# Run benchmark with visualization
+uv run python -m protspace.benchmark.cli --data 3ftx --plot
+
+# Visualize existing results
+uv run python -m protspace.benchmark.cli --data 3ftx --plot-only
 ```
 
 This will:
-- Load embeddings from `output_3ftx/tmp/prot_t5.h5`
-- Run PCA, UMAP, and t-SNE
-- Calculate trustworthiness metric
-- Save projections to `src/protspace/benchmark/results/3ftx/`
-- Save metrics to `metrics.csv`
+- Load embeddings from `data/3ftx/tmp/prot_t5.h5`
+- Run all 6 DR methods (PCA, UMAP, t-SNE, PaCMAP, MDS, LocalMAP) twice (normalized & raw)
+- Calculate trustworthiness and silhouette scores (if labels available)
+- Save metrics to `src/protspace/benchmark/results/3ftx/metrics.csv`
+- Generate side-by-side comparison plots: `normalization_comparison.png`
 
 ## Python API
 
@@ -71,7 +76,7 @@ Import from `protspace.benchmark.metrics`:
 
 - `calculate_trustworthiness` - Local neighborhood preservation (k-NN based) ✓ **Implemented**
 - `calculate_continuity` - Placeholder (not implemented yet)
-- `calculate_silhouette_score` - Placeholder (not implemented yet)
+- `calculate_silhouette_score` / `make_silhouette_metric` - Silhouette on 2D projection with bundle labels ✓ **Implemented** (see ``run.py``)
 - `calculate_knn_preservation` - Placeholder (not implemented yet)
 
 All metrics in `AVAILABLE_METRICS` dictionary. Only use implemented metrics to avoid errors.
@@ -107,46 +112,26 @@ Benchmark multiple methods at once.
 
 ```
 src/protspace/benchmark/
-├── __init__.py                    # Package exports
-├── harness.py                     # Core benchmarking functions
-├── metrics.py                     # Quality metrics
-├── README.md                      # This file
-├── run.py                         # Example benchmark script
-└── results/                       # Benchmark outputs (created automatically)
-    └── <dataset_name>/            # Results organized by dataset
-        ├── pca_projection.npy     # PCA 2D projections
-        ├── umap_projection.npy    # UMAP 2D projections
-        ├── tsne_projection.npy    # t-SNE 2D projections
-        └── metrics.csv            # Benchmark metrics (runtime + quality metrics)
-```
-
-## Configuration
-
-Use `DimensionReductionConfig` to customize DR parameters:
-
-```python
-from protspace.utils.constants import DimensionReductionConfig
-
-config = DimensionReductionConfig(
-    n_components=2,           # 2D or 3D output
-    random_state=42,          # Reproducibility
-    n_neighbors=15,           # For UMAP, PaCMAP, LocalMAP
-    min_dist=0.1,             # UMAP minimum distance
-    perplexity=30,            # t-SNE perplexity
-    metric="euclidean",       # Distance metric
-)
+├── __init__.py           # Package exports
+├── cli.py                # Command-line interface
+├── run.py                # Benchmark orchestration
+├── visualize.py          # Comparison plots
+├── harness.py            # Core benchmarking functions
+├── metrics.py            # Quality metrics
+├── labels.py             # Label loading utilities
+├── io/                   # I/O utilities
+│   ├── paths.py          # Path resolution
+│   └── headers.py        # Header resolution
+└── results/              # Outputs (auto-created)
+    └── <dataset>/
+        ├── metrics.csv
+        ├── normalization_comparison.png
+        ├── normalization_comparison.pdf
+        └── benchmark.parquetbundle
 ```
 
 ## Output Files
 
-### Metrics (`metrics.csv`)
-Contains per-method runtime and quality metrics.
-
-## Next Steps
-
-To implement additional metrics, edit `src/protspace/benchmark/metrics.py`:
-
-1. Replace placeholder functions with actual implementations
-2. Use sklearn, scipy, or custom implementations
-3. Add to `AVAILABLE_METRICS` registry
-4. Update function signatures to match pattern: `(embeddings, projection) -> float`
+- `metrics.csv` - Runtime and quality metrics per method
+- `normalization_comparison.png/pdf` - Side-by-side visualizations
+- `benchmark.parquetbundle` - Web visualization bundle (optional)

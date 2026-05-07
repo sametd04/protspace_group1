@@ -1,38 +1,39 @@
 """Quality metrics for dimensionality reduction evaluation.
 
-This module provides functions to calculate various quality metrics
-for evaluating dimensionality reduction projections.
+Each metric follows the harness pattern ``(embeddings, projection) -> float``
+so it can be plugged into ``benchmark_methods(metric_functions=...)``.
+
+Two flavours of metric:
+- **Geometric metrics** (``calculate_trustworthiness``): only need the
+  high-D embeddings and the 2D projection.
+- **Label-based metrics** (``calculate_silhouette_score``): also need a
+  categorical label per protein. Use the factory ``make_silhouette_metric``
+  to bind labels into a closure that matches the harness signature.
 """
+
+from __future__ import annotations
+
+import warnings
+from collections.abc import Callable
 
 import numpy as np
 from sklearn.manifold import trustworthiness as sklearn_trustworthiness
-from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics import silhouette_score as sklearn_silhouette
 
 
 def calculate_trustworthiness(
     embeddings: np.ndarray, projection: np.ndarray, n_neighbors: int = 15
 ) -> float:
-    """Calculate trustworthiness metric using sklearn.
+    """Trustworthiness: how well the local k-NN structure of the
+    high-dimensional embeddings is preserved in the 2D projection.
 
-    Trustworthiness measures how well the local neighborhood structure
-    is preserved in the low-dimensional projection. A value of 1 indicates
-    perfect preservation, while lower values indicate distortion.
-
-    Args:
-        embeddings: Original high-dimensional embeddings (n_samples, n_features)
-        projection: Low-dimensional projection (n_samples, n_components)
-        n_neighbors: Number of neighbors to consider (default 15)
-
-    Returns:
-        Trustworthiness score (0 to 1, higher is better)
+    Range ``[0, 1]``, higher = better. ``1`` = neighbourhoods perfectly
+    preserved. Reference: Venna & Kaski, 2001.
     """
     n_samples = embeddings.shape[0]
-
-    # Need at least 3 samples for meaningful calculation
     if n_samples < 3:
         return float("nan")
 
-    # Use safer cap (n_samples // 2) to avoid edge cases
     k = min(n_neighbors, n_samples // 2)
 
     try:
@@ -41,123 +42,113 @@ def calculate_trustworthiness(
         )
         return float(score)
     except ValueError as e:
-        import warnings
-
         warnings.warn(f"Trustworthiness calculation failed: {e}", stacklevel=2)
         return float("nan")
 
 
-def get_knn_indices(data: np.ndarray, k: int = 15) -> np.ndarray:
-    """Get k nearest neighbor indices for each sample.
-    
-    Args:
-        data: embeddings (n_samples, n_features)
-        k: number of neighbors
-    
-    Returns:
-        Array of shape (n_samples, k) with neighbor indices
+def calculate_silhouette_score(
+    embeddings: np.ndarray,  # noqa: ARG001  # signature kept for harness compat
+    projection: np.ndarray,
+    labels: np.ndarray | None = None,
+    metric: str = "euclidean",
+) -> float:
+    """Silhouette score on the 2D projection coordinates.
+
+    Measures how well same-label points are clustered together AND
+    separated from other-label points in the projection. Range
+    ``[-1, 1]``, higher = better.
+
+    Notes
+    -----
+    The harness signature is ``(embeddings, projection) -> float``, but
+    silhouette needs labels. Two ways to use this:
+
+    1. Pass labels directly (only works if you call this function manually):
+
+       >>> calculate_silhouette_score(emb, proj, labels=labels)
+
+    2. Use the factory ``make_silhouette_metric`` to bind labels into a
+       closure with the harness-compatible signature:
+
+       >>> metric_fn = make_silhouette_metric(labels)
+       >>> benchmark_methods(..., metric_functions={"silhouette": metric_fn})
+
+    Returns ``NaN`` if no labels are provided, fewer than two distinct
+    classes survive filtering, or fewer than two points remain.
     """
-    nn = NearestNeighbors(n_neighbors=k+1, metric="euclidean")
-    nn.fit(data)
-    indices = nn.kneighbors(return_distance=False)[:, 1:]  # exclude self
-    return indices
-
-
-def compare_knn(high_dim_indices: np.ndarray, low_dim_indices: np.ndarray) -> list:
-    """Compare KNN preservation between spaces.
-    
-    Args:
-        high_dim_indices: KNN indices in original space (n_samples, k)
-        low_dim_indices: KNN indices in projected space (n_samples, k)
-    
-    Returns:
-        List of dicts with preservation stats per sample
-    """
-    results = []
-    for i in range(high_dim_indices.shape[0]):
-        high_set = set(high_dim_indices[i])
-        low_set = set(low_dim_indices[i])
-        overlap = len(high_set.intersection(low_set))
-        k = high_dim_indices.shape[1]
-        preservation = overlap / k
-        results.append({
-            "idx": i,
-            "overlap": overlap,
-            "preservation": preservation
-        })
-    return results
-
-
-def calculate_knn_preservation(embeddings: np.ndarray, projection: np.ndarray, n_neighbors: int = 15) -> float:
-    """Calculate mean k-NN preservation between high-dim and low-dim spaces.
-    
-    Args:
-        embeddings: Original high-dimensional embeddings (n_samples, n_features)
-        projection: Low-dimensional projection (n_samples, n_components)
-        n_neighbors: Number of neighbors to compare (default 15)
-    
-    Returns:
-        Mean preservation score in [0, 1], where 1 means perfect preservation
-    """
-    k = min(n_neighbors, embeddings.shape[0] - 1)
-    if k < 1:
+    if labels is None:
         return float("nan")
-    
-    high_knn = get_knn_indices(embeddings, k=k)
-    low_knn = get_knn_indices(projection, k=k)
-    comparison = compare_knn(high_knn, low_knn)
-    
-    return float(np.mean([c["preservation"] for c in comparison]))
 
+    if projection.shape[0] != labels.shape[0]:
+        raise ValueError(
+            f"projection and labels must have same length, "
+            f"got {projection.shape[0]} vs {labels.shape[0]}"
+        )
 
-def calculate_continuity(embeddings: np.ndarray, projection: np.ndarray, n_neighbors: int = 15) -> float:
-    """Calculate mean continuity: how many non-neighbors in high-dim stay non-neighbors in low-dim.
-    
-    Args:
-        embeddings: Original high-dimensional embeddings (n_samples, n_features)
-        projection: Low-dimensional projection (n_samples, n_components)
-        n_neighbors: Number of neighbors to check (default 15)
-    
-    Returns:
-        Mean continuity score in [0, 1], where 1 means perfect continuity
-    """
-    k = min(n_neighbors, embeddings.shape[0] - 1)
-    if k < 1:
+    valid_mask = np.array(
+        [
+            lbl is not None
+            and not (isinstance(lbl, float) and np.isnan(lbl))
+            and str(lbl).strip() != ""
+            for lbl in labels
+        ]
+    )
+    coords = projection[valid_mask]
+    valid_labels = labels[valid_mask]
+
+    if len(coords) < 2 or len(np.unique(valid_labels)) < 2:
         return float("nan")
-    
-    n_samples = embeddings.shape[0]
-    high_knn = get_knn_indices(embeddings, k=k)
-    low_knn = get_knn_indices(projection, k=k)
-    
-    continuities = []
-    for i in range(n_samples):
-        # Non-neighbors in high-dim space
-        high_neighbors = set(high_knn[i])
-        high_non_neighbors = set(range(n_samples)) - high_neighbors - {i}
-        
-        # Non-neighbors in low-dim space
-        low_neighbors = set(low_knn[i])
-        low_non_neighbors = set(range(n_samples)) - low_neighbors - {i}
-        
-        # How many high-dim non-neighbors are also low-dim non-neighbors
-        # Sample k random non-neighbors from high-dim for fair comparison
-        if high_non_neighbors and low_non_neighbors:
-            k_non = min(k, len(high_non_neighbors), len(low_non_neighbors))
-            high_non_sample = set(list(high_non_neighbors)[:k_non])
-            overlap = len(high_non_sample.intersection(low_non_neighbors))
-            continuity = overlap / k_non
-        else:
-            continuity = 1.0 if not high_non_neighbors else 0.0
-        
-        continuities.append(continuity)
-    
-    return float(np.mean(continuities))
+
+    return float(sklearn_silhouette(coords, valid_labels, metric=metric))
 
 
-# Registry of available metrics
-AVAILABLE_METRICS = {
+def make_silhouette_metric(
+    labels: np.ndarray, metric: str = "euclidean"
+) -> Callable[[np.ndarray, np.ndarray], float]:
+    """Factory that binds labels into a harness-compatible silhouette metric.
+
+    The returned callable has signature ``(embeddings, projection) -> float``
+    so it slots into ``benchmark_methods(metric_functions=...)``. Labels must
+    already be aligned with the embedding row order.
+    """
+
+    def silhouette_metric(embeddings: np.ndarray, projection: np.ndarray) -> float:
+        return calculate_silhouette_score(
+            embeddings, projection, labels=labels, metric=metric
+        )
+
+    silhouette_metric.__name__ = "silhouette"
+    return silhouette_metric
+
+
+AVAILABLE_METRICS: dict[str, Callable] = {
     "trustworthiness": calculate_trustworthiness,
-    "knn_preservation": calculate_knn_preservation,
-    "continuity": calculate_continuity,
+    "silhouette": calculate_silhouette_score,
 }
 
+
+def default_metric_functions(
+    labels: np.ndarray | None = None,
+) -> dict[str, Callable[[np.ndarray, np.ndarray], float]]:
+    """Get default metric functions for benchmark pipeline.
+
+    Returns trustworthiness as baseline metric. If labels are provided,
+    also includes silhouette score.
+
+    Parameters
+    ----------
+    labels
+        Categorical labels aligned with embedding rows. If None,
+        silhouette metric is omitted.
+
+    Returns
+    -------
+    Dictionary mapping metric names to callables with signature
+    ``(embeddings, projection) -> float``.
+    """
+    metrics: dict[str, Callable[[np.ndarray, np.ndarray], float]] = {
+        "trustworthiness": calculate_trustworthiness
+    }
+    if labels is not None:
+        metrics["silhouette"] = make_silhouette_metric(labels)
+    return metrics
