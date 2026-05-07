@@ -99,9 +99,7 @@ def calculate_silhouette_score(
     if len(coords) < 2 or len(np.unique(valid_labels)) < 2:
         return float("nan")
 
-    return float(
-        sklearn_silhouette(coords, valid_labels, metric=metric)
-    )
+    return float(sklearn_silhouette(coords, valid_labels, metric=metric))
 
 
 def make_silhouette_metric(
@@ -127,3 +125,30 @@ AVAILABLE_METRICS: dict[str, Callable] = {
     "trustworthiness": calculate_trustworthiness,
     "silhouette": calculate_silhouette_score,
 }
+
+
+def default_metric_functions(
+    labels: np.ndarray | None = None,
+) -> dict[str, Callable[[np.ndarray, np.ndarray], float]]:
+    """Get default metric functions for benchmark pipeline.
+
+    Returns trustworthiness as baseline metric. If labels are provided,
+    also includes silhouette score.
+
+    Parameters
+    ----------
+    labels
+        Categorical labels aligned with embedding rows. If None,
+        silhouette metric is omitted.
+
+    Returns
+    -------
+    Dictionary mapping metric names to callables with signature
+    ``(embeddings, projection) -> float``.
+    """
+    metrics: dict[str, Callable[[np.ndarray, np.ndarray], float]] = {
+        "trustworthiness": calculate_trustworthiness
+    }
+    if labels is not None:
+        metrics["silhouette"] = make_silhouette_metric(labels)
+    return metrics

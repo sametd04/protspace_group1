@@ -1,41 +1,41 @@
 #!/usr/bin/env python3
-"""Benchmark DR methods on protein embeddings (trustworthiness + silhouette).
+"""Benchmark pipeline orchestration.
 
-Shared paths, label loading, and optional plotting live here so ``visualize.py``
-only forwards to :func:`plot_only_main`.
+Orchestrates the complete benchmark workflow:
+1. Load embeddings
+2. Load labels (if available)
+3. Run all DR methods with metrics
+4. Save results (CSV metrics + parquet bundle)
 
-Usage:
-    uv run python src/protspace/benchmark/run.py
-    uv run python src/protspace/benchmark/run.py --plot
-    uv run python src/protspace/benchmark/run.py --plot-only --data 3ftx
-    DATA=globin uv run python src/protspace/benchmark/run.py --plot
+For CLI usage, see cli.py.
+For visualization, see visualize.py.
 """
 
 from __future__ import annotations
 
-import argparse
-import os
+import json
 import sys
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+import warnings
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "src"))
+# Suppress numerical precision warnings from sklearn
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn")
 
 from protspace.benchmark import benchmark_methods
-from protspace.benchmark.labels import label_summary, load_labels_from_bundle
-from protspace.benchmark.metrics import (
-    calculate_trustworthiness,
-    make_silhouette_metric,
-)
+from protspace.benchmark.io import BenchmarkPaths
+from protspace.benchmark.labels import label_summary, load_silhouette_labels
+from protspace.benchmark.metrics import default_metric_functions
+from protspace.data.io.bundle import write_bundle
 from protspace.data.loaders import load_h5
 from protspace.utils.constants import DimensionReductionConfig
 
+# Benchmark configuration
 METHODS = ["pca", "umap", "tsne", "pacmap", "mds", "localmap"]
 
+# For visualize.py
 METHOD_TITLES = {
     "pca": "PCA",
     "umap": "UMAP",
@@ -44,80 +44,6 @@ METHOD_TITLES = {
     "mds": "MDS",
     "localmap": "LocalMAP",
 }
-
-
-@dataclass(frozen=True)
-class BenchmarkPaths:
-    """Filesystem layout for one named dataset (``DATA`` env / ``--data``)."""
-
-    data: str
-    project_root: Path
-    embedding_path: Path
-    bundle_path: Path
-    output_dir: Path
-    output_png: Path
-
-    @property
-    def headers_npy(self) -> Path:
-        return self.output_dir / "headers.npy"
-
-
-def benchmark_paths(data: str | None = None) -> BenchmarkPaths:
-    d = (data or os.environ.get("DATA", "3ftx")).strip()
-    project_root = Path(__file__).resolve().parent.parent.parent.parent
-    out = Path(__file__).resolve().parent / "results" / d
-    return BenchmarkPaths(
-        data=d,
-        project_root=project_root,
-        embedding_path=project_root / f"output_{d}" / "tmp" / "prot_t5.h5",
-        bundle_path=project_root / f"output_{d}" / "data.parquetbundle",
-        output_dir=out,
-        output_png=out / f"projections_{d}.png",
-    )
-
-
-def resolve_headers(paths: BenchmarkPaths) -> list[str]:
-    """Row order for projections: HDF5 if present, else ``headers.npy``."""
-    if paths.embedding_path.exists():
-        return load_h5([paths.embedding_path]).headers
-    if paths.headers_npy.exists():
-        return list(np.load(paths.headers_npy, allow_pickle=True))
-    raise FileNotFoundError(
-        f"No embeddings at {paths.embedding_path} and no {paths.headers_npy}. "
-        "Run a full benchmark once (needs prot_t5.h5) or keep headers.npy."
-    )
-
-
-def load_silhouette_labels(paths: BenchmarkPaths, headers: list[str]) -> np.ndarray | None:
-    """Labels aligned to ``headers`` for silhouette; ``None`` if no bundle."""
-    if not paths.bundle_path.exists():
-        return None
-    return load_labels_from_bundle(paths.bundle_path, headers)
-
-
-def default_metric_functions(
-    labels: np.ndarray | None,
-) -> dict[str, Any]:
-    """Trustworthiness always; silhouette when ``labels`` is not ``None``."""
-    out: dict[str, Any] = {"trustworthiness": calculate_trustworthiness}
-    if labels is not None:
-        out["silhouette"] = make_silhouette_metric(labels)
-    return out
-
-
-def _print_label_intro(labels: np.ndarray | None, paths: BenchmarkPaths) -> None:
-    if labels is None:
-        print(f"[warn] No bundle at {paths.bundle_path} — silhouette will be NaN\n")
-        return
-    summary = label_summary(labels)
-    print(
-        f"Loaded labels: {summary['n_labelled']}/{summary['n_total']} "
-        f"proteins, {summary['n_classes']} classes"
-    )
-    print("Top classes:")
-    for cls, n in list(summary["classes"].items())[:5]:
-        print(f"  {n:4d}  {cls}")
-    print()
 
 
 def run_benchmark(paths: BenchmarkPaths) -> None:
@@ -136,12 +62,16 @@ def run_benchmark(paths: BenchmarkPaths) -> None:
     headers = emb_set.headers
 
     print(
-        f"Loaded {embeddings.shape[0]} proteins with "
-        f"{embeddings.shape[1]} features\n"
+        f"Loaded {embeddings.shape[0]} proteins with {embeddings.shape[1]} features\n"
     )
 
     labels = load_silhouette_labels(paths, headers)
-    _print_label_intro(labels, paths)
+    if labels is not None:
+        summary = label_summary(labels)
+        print(
+            f"Labels: {summary['n_labelled']}/{summary['n_total']} proteins, "
+            f"{summary['n_classes']} classes\n"
+        )
 
     config = DimensionReductionConfig(
         n_components=2,
@@ -156,11 +86,22 @@ def run_benchmark(paths: BenchmarkPaths) -> None:
     print(f"Metrics: {', '.join(metric_functions.keys())}\n")
     print("=" * 70)
 
+    # Run with normalization
     results = benchmark_methods(
         embeddings=embeddings,
         methods=METHODS,
         config=config,
         normalize=True,
+        metric_functions=metric_functions,
+    )
+
+    # Run without normalization for comparison
+    print("\nRunning without normalization for comparison...")
+    results_raw = benchmark_methods(
+        embeddings=embeddings,
+        methods=METHODS,
+        config=config,
+        normalize=False,
         metric_functions=metric_functions,
     )
 
@@ -180,9 +121,7 @@ def run_benchmark(paths: BenchmarkPaths) -> None:
 
     paths.output_dir.mkdir(exist_ok=True, parents=True)
 
-    for method, result in results.items():
-        np.save(paths.output_dir / f"{method}_projection.npy", result.projection)
-
+    # Save metrics as CSV
     metrics_data = []
     for method, result in results.items():
         row = {"method": method, "runtime_seconds": result.time_seconds}
@@ -193,219 +132,87 @@ def run_benchmark(paths: BenchmarkPaths) -> None:
     metrics_csv = paths.output_dir / "metrics.csv"
     metrics_df.to_csv(metrics_csv, index=False)
 
-    np.save(paths.headers_npy, np.array(headers, dtype=object))
+    # # Save raw projections as .npy for visualization
+    # for method, result in results.items():
+    #     np.save(paths.output_dir / f"{method}_projection.npy", result.projection)
+
+    # Create ProtSpace bundle for web visualization
+    print("\nCreating ProtSpace bundle for visualization...")
+
+    # Load or create annotations table
+    annotations_table = None
+    if paths.bundle_path.exists():
+        print(f"Loading annotations from {paths.bundle_path}")
+        try:
+            import io
+
+            import pyarrow.parquet as pq
+
+            from protspace.data.io.bundle import read_bundle
+
+            parts_bytes, _ = read_bundle(paths.bundle_path)
+            if len(parts_bytes) > 0 and parts_bytes[0]:
+                # Parse first part (annotations) from bytes
+                annotations_table = pq.read_table(io.BytesIO(parts_bytes[0]))
+                print(
+                    f"Annotations table: {len(annotations_table)} rows, {len(annotations_table.column_names)} columns"
+                )
+        except Exception as e:
+            print(f"[warn] Could not load existing bundle: {e}")
+
+    # Create minimal annotations table if none exists
+    if annotations_table is None:
+        print("Creating minimal annotations table from headers")
+        annotations_df = pd.DataFrame(
+            {
+                "protein_id": headers,
+                "identifier": headers,
+            }
+        )
+        annotations_table = pa.Table.from_pandas(annotations_df)
+        print(
+            f"Annotations table: {len(annotations_table)} rows, {len(annotations_table.column_names)} columns"
+        )
+
+    # Create projections metadata table
+    metadata_rows = []
+    for method, result in results.items():
+        metadata_rows.append(
+            {
+                "projection_name": f"{method.upper()}_benchmark",
+                "dimensions": 2,
+                "info_json": json.dumps(result.params),
+            }
+        )
+    metadata_df = pd.DataFrame(metadata_rows)
+    metadata_table = pa.Table.from_pandas(metadata_df)
+    print(f"Metadata table: {len(metadata_table)} rows")
+
+    # Create projections data table
+    data_rows = []
+    for method, result in results.items():
+        proj_name = f"{method.upper()}_benchmark"
+        for i, header in enumerate(headers):
+            data_rows.append(
+                {
+                    "projection_name": proj_name,
+                    "identifier": header,
+                    "x": np.float32(result.projection[i][0]),
+                    "y": np.float32(result.projection[i][1]),
+                    "z": None,
+                }
+            )
+    data_df = pd.DataFrame(data_rows)
+    data_table = pa.Table.from_pandas(data_df)
+    print(f"Data table: {len(data_table)} rows")
+
+    # Write bundle
+    bundle_path = paths.output_dir / "benchmark.parquetbundle"
+    print(f"Writing bundle to {bundle_path}...")
+    write_bundle([annotations_table, metadata_table, data_table], bundle_path)
+    print("Bundle written successfully!")
 
     print(f"\nProjections saved to {paths.output_dir}/")
     print(f"Metrics saved to {metrics_csv}")
+    print(f"\nVisualize with: protspace serve {bundle_path}")
     print("=" * 70)
-
-
-def _short(s: str, n: int = 26) -> str:
-    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
-
-
-def _scatter_panel(ax, coords, labels, title, color_map, sizes_by_class) -> None:
-    classes_sorted = sorted(
-        color_map.keys(), key=lambda c: -sizes_by_class.get(c, 0)
-    )
-    for cls in classes_sorted:
-        mask = labels == cls
-        if not mask.any():
-            continue
-        ax.scatter(
-            coords[mask, 0],
-            coords[mask, 1],
-            s=14,
-            alpha=0.85,
-            color=color_map[cls],
-            label=f"{_short(cls)} (n={mask.sum()})",
-            edgecolor="white",
-            linewidth=0.25,
-        )
-
-    unl = np.array([lbl is None for lbl in labels])
-    if unl.any():
-        ax.scatter(
-            coords[unl, 0],
-            coords[unl, 1],
-            s=8,
-            alpha=0.35,
-            color="lightgrey",
-            label=f"unlabelled (n={unl.sum()})",
-        )
-
-    ax.set_title(title, fontsize=10)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.grid(alpha=0.15)
-
-
-def render_projection_figure(paths: BenchmarkPaths) -> Path:
-    """Write ``projections_<DATA>.png`` from saved ``*_projection.npy`` + metrics."""
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError as e:
-        raise ImportError(
-            "Plotting requires matplotlib. Install with: "
-            "uv sync --extra benchmark"
-        ) from e
-
-    if not paths.output_dir.exists():
-        raise FileNotFoundError(f"No results at {paths.output_dir}. Run benchmark first.")
-
-    proj_files = sorted(paths.output_dir.glob("*_projection.npy"))
-    if not proj_files:
-        raise FileNotFoundError(f"No projections in {paths.output_dir}.")
-
-    metrics_csv = paths.output_dir / "metrics.csv"
-    metrics_df = (
-        pd.read_csv(metrics_csv).set_index("method") if metrics_csv.exists() else None
-    )
-
-    headers = resolve_headers(paths)
-
-    labels: np.ndarray
-    if paths.bundle_path.exists():
-        labels = load_labels_from_bundle(paths.bundle_path, headers)
-        summary = label_summary(labels)
-        print(
-            f"Labels: {summary['n_labelled']}/{summary['n_total']} "
-            f"proteins, {summary['n_classes']} classes"
-        )
-    else:
-        print(f"[warn] No bundle at {paths.bundle_path} — points uncoloured")
-        labels = np.array([None] * len(headers), dtype=object)
-
-    classes = (
-        pd.Series(labels).dropna().value_counts().index.tolist()
-    )
-    sizes_by_class = pd.Series(labels).value_counts(dropna=True).to_dict()
-    cmap = plt.colormaps["tab20"](np.linspace(0, 1, max(len(classes), 1)))
-    color_map = {cls: cmap[i] for i, cls in enumerate(classes)}
-
-    n_methods = len(proj_files)
-    n_cols = 3
-    n_rows = (n_methods + n_cols - 1) // n_cols
-    fig, axes = plt.subplots(
-        n_rows, n_cols, figsize=(4.6 * n_cols, 4.4 * n_rows), squeeze=False
-    )
-
-    norm_stats = []
-    for ax, proj_file in zip(axes.flat, proj_files, strict=False):
-        method = proj_file.stem.replace("_projection", "")
-        coords = np.load(proj_file)
-
-        norm_stats.append(
-            (
-                method,
-                tuple(coords.mean(axis=0).round(4)),
-                tuple(coords.std(axis=0).round(4)),
-                tuple(coords.min(axis=0).round(2)),
-                tuple(coords.max(axis=0).round(2)),
-            )
-        )
-
-        title_parts = [METHOD_TITLES.get(method, method.upper())]
-        if metrics_df is not None and method in metrics_df.index:
-            row = metrics_df.loc[method]
-            extras = []
-            if "trustworthiness" in row and not pd.isna(row["trustworthiness"]):
-                extras.append(f"T={row['trustworthiness']:.3f}")
-            if "silhouette" in row and not pd.isna(row["silhouette"]):
-                extras.append(f"S={row['silhouette']:+.3f}")
-            if "runtime_seconds" in row and not pd.isna(row["runtime_seconds"]):
-                extras.append(f"{row['runtime_seconds']:.2f}s")
-            if extras:
-                title_parts.append("  ".join(extras))
-        title = "\n".join(title_parts)
-
-        _scatter_panel(ax, coords, labels, title, color_map, sizes_by_class)
-
-    for ax in axes.flat[n_methods:]:
-        ax.axis("off")
-
-    print("\nNormalization sanity check (after normalize_projection):")
-    print(f"  {'method':<10s} {'mean':<22s} {'std':<22s} {'min':<22s} {'max':<22s}")
-    for method, m, s, lo, hi in norm_stats:
-        print(f"  {method:<10s} {str(m):<22s} {str(s):<22s} {str(lo):<22s} {str(hi):<22s}")
-    print(
-        "\n→ After normalization, mean should be ~(0, 0). std should be similar "
-        "across methods (unit-variance scaling)."
-    )
-
-    handles, labels_legend = axes.flat[0].get_legend_handles_labels()
-    if handles:
-        fig.legend(
-            handles,
-            labels_legend,
-            loc="lower center",
-            ncol=4,
-            fontsize=8,
-            frameon=False,
-            bbox_to_anchor=(0.5, -0.04),
-        )
-
-    n_total = len(labels)
-    n_lab = sum(1 for lbl in labels if lbl is not None)
-    fig.suptitle(
-        f"Benchmark projections — {paths.data}  "
-        f"(n={n_total}, labelled={n_lab}, {len(classes)} classes)  ·  "
-        f"T = trustworthiness ↑, S = silhouette ↑",
-        fontsize=12,
-        y=1.0,
-    )
-    fig.tight_layout()
-    fig.savefig(paths.output_png, dpi=150, bbox_inches="tight")
-    print(f"\nWrote {paths.output_png}")
-    return paths.output_png
-
-
-def plot_only_main(argv: list[str] | None = None) -> None:
-    """CLI entry used by ``visualize.py`` (plot only, no DR re-run)."""
-    p = argparse.ArgumentParser(description="Plot saved benchmark projections.")
-    p.add_argument(
-        "--data",
-        default=os.environ.get("DATA", "3ftx"),
-        help="Dataset name (default: env DATA or 3ftx)",
-    )
-    args = p.parse_args(argv)
-    render_projection_figure(benchmark_paths(args.data))
-
-
-def _parse_main_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Benchmark DR methods (optionally save projection figure)."
-    )
-    parser.add_argument(
-        "--data",
-        default=os.environ.get("DATA", "3ftx"),
-        help="Dataset name (default: env DATA or 3ftx)",
-    )
-    parser.add_argument(
-        "--plot",
-        action="store_true",
-        help="After benchmarking, write projections_<DATA>.png",
-    )
-    parser.add_argument(
-        "--plot-only",
-        action="store_true",
-        help="Only render figure from existing results (no embedding required)",
-    )
-    return parser.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> None:
-    args = _parse_main_args(argv)
-    paths = benchmark_paths(args.data)
-
-    if args.plot_only:
-        render_projection_figure(paths)
-        return
-
-    run_benchmark(paths)
-    if args.plot:
-        render_projection_figure(paths)
-
-
-if __name__ == "__main__":
-    main()

@@ -18,6 +18,11 @@ column="protein_families", filter_keywords=False)``.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from protspace.benchmark.io.paths import BenchmarkPaths
+
 import io
 from pathlib import Path
 
@@ -124,10 +129,32 @@ def load_labels_from_bundle(
         if small:
             ann.loc[ann["_label"].isin(small), "_label"] = None
 
-    id_to_label = dict(
-        zip(ann["protein_id"], ann["_label"], strict=False)
-    )
+    id_to_label = dict(zip(ann["protein_id"], ann["_label"], strict=False))
     return np.array([id_to_label.get(h) for h in headers], dtype=object)
+
+
+def load_silhouette_labels(
+    paths: BenchmarkPaths, headers: list[str]
+) -> np.ndarray | None:
+    """Load labels for silhouette metric from bundle.
+
+    Convenience wrapper around load_labels_from_bundle for benchmark pipeline.
+    Returns None if bundle doesn't exist (graceful degradation).
+
+    Parameters
+    ----------
+    paths
+        Benchmark paths configuration.
+    headers
+        Protein IDs in embedding order.
+
+    Returns
+    -------
+    Label array or None if bundle unavailable.
+    """
+    if not paths.bundle_path.exists():
+        return None
+    return load_labels_from_bundle(paths.bundle_path, headers)
 
 
 def label_summary(labels: np.ndarray) -> dict[str, int | dict[str, int]]:
@@ -140,7 +167,5 @@ def label_summary(labels: np.ndarray) -> dict[str, int | dict[str, int]]:
         "n_total": len(labels),
         "n_labelled": len(valid),
         "n_classes": len(classes),
-        "classes": dict(
-            sorted(classes.items(), key=lambda kv: -kv[1])
-        ),
+        "classes": dict(sorted(classes.items(), key=lambda kv: -kv[1])),
     }
