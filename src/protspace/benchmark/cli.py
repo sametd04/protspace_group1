@@ -2,9 +2,20 @@
 """CLI for benchmarking DR methods on protein embeddings.
 
 Usage:
+    # Individual datasets
     uv run python -m protspace.benchmark.cli --data 3ftx
+    uv run python -m protspace.benchmark.cli --data toxprot
+    uv run python -m protspace.benchmark.cli --data pla2g2
+    uv run python -m protspace.benchmark.cli --data cath_s40
+    uv run python -m protspace.benchmark.cli --data swissprot_rr
+
+    # With plot output
     uv run python -m protspace.benchmark.cli --data 3ftx --plot
+
+    # Re-render plots from existing benchmark outputs
     uv run python -m protspace.benchmark.cli --data 3ftx --plot-only
+
+    # Dataset via environment variable
     DATA=globin uv run python -m protspace.benchmark.cli --plot
 """
 
