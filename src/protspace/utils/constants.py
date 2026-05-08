@@ -45,6 +45,7 @@ class DimensionReductionConfig:
     metric: METRIC_TYPES = field(
         default="euclidean", metadata={"allowed": list(get_args(METRIC_TYPES))}
     )
+
     precomputed: bool = field(default=False)
     min_dist: float = field(default=0.1, metadata={"gte": 0, "lte": 1})
     perplexity: int = field(default=30, metadata={"gte": 5, "lte": 50})

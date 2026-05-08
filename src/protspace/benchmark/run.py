@@ -1,51 +1,90 @@
 #!/usr/bin/env python3
 """Minimal benchmark script for protein datasets.
 
-Runs PCA, UMAP, and t-SNE benchmarks on specified dataset.
+Runs a configured set of DR methods, computes timing and quality metrics
+(trustworthiness, silhouette, concordex), and writes results to
+``results/<DATA>/``.
 
 Usage:
-    python run_benchmark_real_data.py
+    python run.py
+    DATA=globin python run.py     # override dataset via env var
 """
 
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-# Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "src"))
 
 from protspace.benchmark import benchmark_methods
-from protspace.benchmark.metrics import calculate_trustworthiness, calculate_knn_preservation, calculate_continuity
+from protspace.benchmark.labels import label_summary, load_labels_from_bundle
+from protspace.benchmark.metrics import (
+    calculate_trustworthiness,
+    make_concordex_metric,
+    make_silhouette_metric,
+)
 from protspace.data.loaders import load_h5
 from protspace.utils.constants import DimensionReductionConfig
 
-# ===== Configuration =====
-# Dataset name (used for organizing results)
-DATA = "3ftx"
+DATA = os.environ.get("DATA", "3ftx")
 
-# Fixed configuration - paths relative to project root
-# File is at: src/protspace/benchmark/run_benchmark_real_data.py
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 EMBEDDING_PATH = PROJECT_ROOT / f"output_{DATA}" / "tmp" / "prot_t5.h5"
+BUNDLE_PATH = PROJECT_ROOT / f"output_{DATA}" / "data.parquetbundle"
+
 METHODS = ["pca", "umap", "tsne", "pacmap", "mds", "localmap"]
-# Save results in benchmark/results/$DATA/ directory
 OUTPUT_DIR = Path(__file__).parent / "results" / DATA
+
+# Concordex configuration. The number of permutations trades off cost
+# against null-mean precision; 15 is the default in the concordexR
+# package and is comfortable for n in the low thousands.
+CONCORDEX_N_NEIGHBORS = 15
+CONCORDEX_N_PERMUTATIONS = 15
+CONCORDEX_RANDOM_STATE = 42
 
 
 def main():
-    print("Loading embeddings from", EMBEDDING_PATH)
+    print(f"=== Benchmark on '{DATA}' ===\n")
+    print(f"Loading embeddings from {EMBEDDING_PATH}")
 
-    # Load using existing protspace loader
+    if not EMBEDDING_PATH.exists():
+        sys.exit(
+            f"Embeddings not found at {EMBEDDING_PATH}.\n"
+            f"Generate with: protspace prepare -q '<query>' "
+            f"-e prot_t5 -m pca2,umap2 -o output_{DATA}"
+        )
+
     emb_set = load_h5([EMBEDDING_PATH])
     embeddings = emb_set.data
-
+    headers = emb_set.headers
     print(
-        f"Loaded {embeddings.shape[0]} proteins with {embeddings.shape[1]} features\n"
+        f"Loaded {embeddings.shape[0]} proteins with "
+        f"{embeddings.shape[1]} features\n"
     )
 
-    # Configure DR
+    # Labels are required for silhouette and concordex; both are skipped
+    # automatically if the bundle is missing.
+    labels = None
+    if BUNDLE_PATH.exists():
+        labels = load_labels_from_bundle(BUNDLE_PATH, headers)
+        summary = label_summary(labels)
+        print(
+            f"Loaded labels: {summary['n_labelled']}/{summary['n_total']} "
+            f"proteins, {summary['n_classes']} classes"
+        )
+        print("Top classes:")
+        for cls, n in list(summary["classes"].items())[:5]:
+            print(f"  {n:4d}  {cls}")
+        print()
+    else:
+        print(
+            f"[warn] No bundle at {BUNDLE_PATH} — silhouette and concordex "
+            f"will be NaN\n"
+        )
+
     config = DimensionReductionConfig(
         n_components=2,
         random_state=42,
@@ -53,18 +92,25 @@ def main():
         perplexity=min(30, embeddings.shape[0] // 4),
     )
 
-    # Use only implemented metrics (avoid NotImplementedError)
-    metric_functions = {
+    # Build the metrics dict. Both label-based metrics use closures that
+    # capture ``labels`` so they conform to the harness signature
+    # ``(embeddings, projection) -> float``.
+    metric_functions: dict[str, callable] = {
         "trustworthiness": calculate_trustworthiness,
-        "knn_preservation": calculate_knn_preservation,
-        "continuity": calculate_continuity,
     }
+    if labels is not None:
+        metric_functions["silhouette"] = make_silhouette_metric(labels)
+        metric_functions["concordex"] = make_concordex_metric(
+            labels,
+            n_neighbors=CONCORDEX_N_NEIGHBORS,
+            n_permutations=CONCORDEX_N_PERMUTATIONS,
+            random_state=CONCORDEX_RANDOM_STATE,
+        )
 
     print(f"Benchmarking methods: {', '.join(METHODS)}")
     print(f"Metrics: {', '.join(metric_functions.keys())}\n")
     print("=" * 70)
 
-    # Run benchmark using existing harness
     results = benchmark_methods(
         embeddings=embeddings,
         methods=METHODS,
@@ -73,7 +119,6 @@ def main():
         metric_functions=metric_functions,
     )
 
-    # Print results
     print("\nRESULTS:")
     print("=" * 70)
     for method, result in results.items():
@@ -85,17 +130,15 @@ def main():
             for name, value in result.metrics.items():
                 if not np.isnan(value):
                     print(f"    {name}: {value:.6f}")
+                else:
+                    print(f"    {name}: NaN")
 
-
-    # Save projections and metrics
     OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
-    # Save projections as .npy files
     for method, result in results.items():
         proj_file = OUTPUT_DIR / f"{method}_projection.npy"
         np.save(proj_file, result.projection)
 
-    # Save metrics as CSV
     metrics_data = []
     for method, result in results.items():
         row = {"method": method, "runtime_seconds": result.time_seconds}
@@ -105,6 +148,8 @@ def main():
     metrics_df = pd.DataFrame(metrics_data)
     metrics_csv = OUTPUT_DIR / "metrics.csv"
     metrics_df.to_csv(metrics_csv, index=False)
+
+    np.save(OUTPUT_DIR / "headers.npy", np.array(headers, dtype=object))
 
     print(f"\nProjections saved to {OUTPUT_DIR}/")
     print(f"Metrics saved to {metrics_csv}")
