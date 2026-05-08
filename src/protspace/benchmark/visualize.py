@@ -14,13 +14,13 @@ import warnings
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Suppress numerical precision warnings from sklearn
-warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn")
-
 from protspace.benchmark.io import BenchmarkPaths, benchmark_paths
 from protspace.benchmark.labels import label_summary, load_silhouette_labels
 from protspace.benchmark.run import METHOD_TITLES, METHODS
 from protspace.data.loaders import load_h5
+
+# Suppress numerical precision warnings from sklearn
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn")
 
 
 def visualize_comparison(paths: BenchmarkPaths) -> None:
@@ -134,7 +134,7 @@ def visualize_comparison(paths: BenchmarkPaths) -> None:
             transform=ax_norm.transAxes,
             verticalalignment="top",
             fontsize=8,
-            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+            bbox={"boxstyle": "round", "facecolor": "wheat", "alpha": 0.5},
         )
 
         # Plot raw (right column)
@@ -182,7 +182,7 @@ def visualize_comparison(paths: BenchmarkPaths) -> None:
             transform=ax_raw.transAxes,
             verticalalignment="top",
             fontsize=8,
-            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+            bbox={"boxstyle": "round", "facecolor": "wheat", "alpha": 0.5},
         )
 
     # Add legend (only once, at the bottom)
