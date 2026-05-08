@@ -25,6 +25,8 @@ from protspace.data.loaders import load_h5
 
 def visualize_comparison(paths: BenchmarkPaths) -> None:
     """Generate side-by-side comparison plots with colors."""
+    paths.output_dir.mkdir(exist_ok=True, parents=True)
+
     # Load embeddings and run both normalized and raw
     emb_set = load_h5([paths.embedding_path])
     embeddings = emb_set.data

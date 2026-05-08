@@ -2,9 +2,20 @@
 """CLI for benchmarking DR methods on protein embeddings.
 
 Usage:
+    # Individual datasets
     uv run python -m protspace.benchmark.cli --data 3ftx
+    uv run python -m protspace.benchmark.cli --data toxprot
+    uv run python -m protspace.benchmark.cli --data pla2g2
+    uv run python -m protspace.benchmark.cli --data cath_s40
+    uv run python -m protspace.benchmark.cli --data swissprot_rr
+
+    # With plot output
     uv run python -m protspace.benchmark.cli --data 3ftx --plot
+
+    # Re-render plots from existing benchmark outputs
     uv run python -m protspace.benchmark.cli --data 3ftx --plot-only
+
+    # Dataset via environment variable
     DATA=globin uv run python -m protspace.benchmark.cli --plot
 """
 
@@ -30,7 +41,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--plot",
         action="store_true",
-        help="After benchmarking, write projections_<DATA>.png",
+        help=(
+            "After benchmarking, write normalization_comparison.png in "
+            "src/protspace/benchmark/results/<DATA>/"
+        ),
     )
     parser.add_argument(
         "--plot-only",
