@@ -6,6 +6,7 @@ Usage examples:
     uv run python scripts/download_project_datasets.py --datasets toxprot pla2g2 cath_s40
     uv run python scripts/download_project_datasets.py --toxprot-max 2000 --cath-max 5000
     uv run python scripts/download_project_datasets.py --swissprot-max 50000
+    uv run python scripts/download_project_datasets.py --percent 25
     uv run python scripts/download_project_datasets.py --no-embed-h5
     uv run python scripts/download_project_datasets.py --report-sizes
     uv run python scripts/download_project_datasets.py --report-only
@@ -18,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import math
 import os
 import re
 import shutil
@@ -146,6 +148,35 @@ def _download_uniprot_fasta(
     return total_written
 
 
+def _get_uniprot_total_results(query: str, timeout: int = 120) -> int:
+    response = requests.get(
+        UNIPROT_SEARCH_URL,
+        params={"query": query, "format": "fasta", "size": 1},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return int(response.headers.get("x-total-results", "0"))
+
+
+def _resolve_subset_limit(
+    total_available: int,
+    *,
+    max_sequences: int | None,
+    percent: float | None,
+) -> int | None:
+    if total_available <= 0:
+        return 0
+    if percent is None:
+        return max_sequences
+
+    percent_limit = max(1, math.ceil(total_available * (percent / 100.0)))
+    return (
+        min(max_sequences, percent_limit)
+        if max_sequences is not None
+        else percent_limit
+    )
+
+
 def _read_3ftx_accessions(csv_path: Path) -> list[str]:
     accessions: set[str] = set()
     with csv_path.open() as handle:
@@ -175,7 +206,12 @@ def _chunked(values: Iterable[str], size: int) -> Iterable[list[str]]:
 
 
 def _download_3ftx(
-    out_dir: Path, *, max_sequences: int | None, timeout: int, batch_size: int
+    out_dir: Path,
+    *,
+    max_sequences: int | None,
+    percent: float | None,
+    timeout: int,
+    batch_size: int,
 ) -> None:
     dataset_dir = out_dir / "3ftx"
     dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -189,8 +225,11 @@ def _download_3ftx(
         _download_file(THREE_FTX_CSV_URL, csv_path, timeout=timeout)
 
     accessions = _read_3ftx_accessions(csv_path)
-    if max_sequences is not None:
-        accessions = accessions[:max_sequences]
+    limit = _resolve_subset_limit(
+        len(accessions), max_sequences=max_sequences, percent=percent
+    )
+    if limit is not None:
+        accessions = accessions[:limit]
     logger.info("3FTx: downloading %s Swiss-Prot sequences", len(accessions))
 
     output_fasta = dataset_dir / "3ftx_reviewed.fasta"
@@ -214,23 +253,35 @@ def _download_3ftx(
 
 
 def _download_toxprot(
-    out_dir: Path, *, max_sequences: int | None, timeout: int, batch_size: int
+    out_dir: Path,
+    *,
+    max_sequences: int | None,
+    percent: float | None,
+    timeout: int,
+    batch_size: int,
 ) -> None:
     dataset_dir = out_dir / "toxprot"
     dataset_dir.mkdir(parents=True, exist_ok=True)
     query = "(keyword:KW-0800) AND (reviewed:true)"
+    limit = _resolve_subset_limit(
+        _get_uniprot_total_results(query, timeout=timeout),
+        max_sequences=max_sequences,
+        percent=percent,
+    )
     output_fasta = dataset_dir / "toxprot_reviewed.fasta"
     count = _download_uniprot_fasta(
         query,
         output_fasta,
-        max_sequences=max_sequences,
+        max_sequences=limit,
         batch_size=batch_size,
         timeout=timeout,
     )
     logger.info("ToxProt FASTA saved: %s (%s sequences)", output_fasta, count)
 
 
-def _download_pla2g2(out_dir: Path, *, max_sequences: int | None, timeout: int) -> None:
+def _download_pla2g2(
+    out_dir: Path, *, max_sequences: int | None, percent: float | None, timeout: int
+) -> None:
     dataset_dir = out_dir / "pla2g2"
     dataset_dir.mkdir(parents=True, exist_ok=True)
 
@@ -242,15 +293,19 @@ def _download_pla2g2(out_dir: Path, *, max_sequences: int | None, timeout: int) 
     else:
         _download_file(PLA2G2_FASTA_URL, output_fasta, timeout=timeout)
 
-    if max_sequences is not None:
-        trimmed = _trim_fasta(output_fasta, max_sequences)
+    total_sequences = _count_fasta_sequences(output_fasta)
+    limit = _resolve_subset_limit(
+        total_sequences, max_sequences=max_sequences, percent=percent
+    )
+    if limit is not None and limit < total_sequences:
+        trimmed = _trim_fasta(output_fasta, limit)
         logger.info("Pla2g2 FASTA trimmed to %s sequences", trimmed)
     else:
-        logger.info("Pla2g2 FASTA sequences: %s", _count_fasta_sequences(output_fasta))
+        logger.info("Pla2g2 FASTA sequences: %s", total_sequences)
 
 
 def _download_cath_s40(
-    out_dir: Path, *, max_sequences: int | None, timeout: int
+    out_dir: Path, *, max_sequences: int | None, percent: float | None, timeout: int
 ) -> None:
     dataset_dir = out_dir / "cath_s40"
     dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -261,11 +316,15 @@ def _download_cath_s40(
     _download_file(CATH_S40_FASTA_URL, fasta_path, timeout=timeout)
     _download_file(CATH_S40_LIST_URL, list_path, timeout=timeout)
 
-    if max_sequences is not None:
-        trimmed = _trim_fasta(fasta_path, max_sequences)
+    total_sequences = _count_fasta_sequences(fasta_path)
+    limit = _resolve_subset_limit(
+        total_sequences, max_sequences=max_sequences, percent=percent
+    )
+    if limit is not None and limit < total_sequences:
+        trimmed = _trim_fasta(fasta_path, limit)
         logger.info("CATH S40 FASTA trimmed to %s sequences", trimmed)
     else:
-        logger.info("CATH S40 FASTA sequences: %s", _count_fasta_sequences(fasta_path))
+        logger.info("CATH S40 FASTA sequences: %s", total_sequences)
 
 
 def _run_mmseqs_redundancy_reduction(
@@ -302,6 +361,7 @@ def _download_swissprot(
     out_dir: Path,
     *,
     max_sequences: int | None,
+    percent: float | None,
     timeout: int,
     batch_size: int,
     identity: float | None,
@@ -311,10 +371,15 @@ def _download_swissprot(
     full_fasta = dataset_dir / "swissprot_reviewed.fasta"
 
     query = "reviewed:true"
+    limit = _resolve_subset_limit(
+        _get_uniprot_total_results(query, timeout=timeout),
+        max_sequences=max_sequences,
+        percent=percent,
+    )
     count = _download_uniprot_fasta(
         query,
         full_fasta,
-        max_sequences=max_sequences,
+        max_sequences=limit,
         batch_size=batch_size,
         timeout=timeout,
     )
@@ -333,9 +398,8 @@ def _download_swissprot(
         )
 
 
-def _ensure_output_folders(datasets: Iterable[str]) -> None:
-    for dataset in datasets:
-        (PROJECT_ROOT / f"output_{dataset}" / "tmp").mkdir(parents=True, exist_ok=True)
+def _h5_output_dir_for_dataset(data_dir: Path, dataset: str) -> Path:
+    return data_dir / dataset
 
 
 def _fasta_path_for_dataset(data_dir: Path, dataset: str) -> Path:
@@ -362,8 +426,8 @@ def _embed_dataset_h5(
             f"Missing FASTA for dataset '{dataset}': {fasta_path}"
         )
 
-    output_tmp = PROJECT_ROOT / f"output_{dataset}" / "tmp"
-    output_tmp.mkdir(parents=True, exist_ok=True)
+    output_dir = _h5_output_dir_for_dataset(data_dir, dataset)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     if shutil.which("uv"):
         cmd = [
@@ -376,7 +440,7 @@ def _embed_dataset_h5(
             "-e",
             embedder,
             "-o",
-            str(output_tmp),
+            str(output_dir),
             "--batch-size",
             str(batch_size),
         ]
@@ -389,7 +453,7 @@ def _embed_dataset_h5(
             "-e",
             embedder,
             "-o",
-            str(output_tmp),
+            str(output_dir),
             "--batch-size",
             str(batch_size),
         ]
@@ -416,6 +480,13 @@ def _human_size(num_bytes: int) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024.0
     return f"{num_bytes} B"
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(PROJECT_ROOT.resolve()))
+    except ValueError:
+        return str(path)
 
 
 def _count_h5_embeddings(h5_path: Path) -> int:
@@ -446,9 +517,9 @@ def report_dataset_file_sizes(
 
     for dataset in sorted(datasets):
         fasta_path = _fasta_path_for_dataset(data_dir, dataset)
-        h5_path = PROJECT_ROOT / f"output_{dataset}" / "tmp" / f"{embedder}.h5"
+        h5_path = _h5_output_dir_for_dataset(data_dir, dataset) / f"{embedder}.h5"
 
-        fasta_rel = str(fasta_path.relative_to(PROJECT_ROOT)) if fasta_path.exists() else "-"
+        fasta_rel = _display_path(fasta_path) if fasta_path.exists() else "-"
         fasta_size = _human_size(fasta_path.stat().st_size) if fasta_path.exists() else "-"
         fasta_count = str(_count_fasta_sequences(fasta_path)) if fasta_path.exists() else "-"
 
@@ -546,10 +617,19 @@ def main() -> None:
         help="Disable subset limits and download full datasets.",
     )
     parser.add_argument(
+        "--percent",
+        type=float,
+        default=None,
+        help=(
+            "Percent of each dataset to download (0-100). "
+            "Applied in addition to --*-max (smaller limit wins)."
+        ),
+    )
+    parser.add_argument(
         "--embed-h5",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Also generate output_<dataset>/tmp/<embedder>.h5 (default: true).",
+        help="Also generate <output-dir>/<dataset>/<embedder>.h5 (default: true).",
     )
     parser.add_argument(
         "--embedder",
@@ -582,6 +662,10 @@ def main() -> None:
         args.pla2g2_max = None
         args.cath_max = None
         args.swissprot_max = None
+        args.percent = None
+
+    if args.percent is not None and not (0 < args.percent <= 100):
+        parser.error("--percent must be > 0 and <= 100")
 
     level = {0: logging.WARNING, 1: logging.INFO}.get(args.verbose, logging.DEBUG)
     logging.basicConfig(
@@ -601,6 +685,7 @@ def main() -> None:
         _download_3ftx(
             args.output_dir,
             max_sequences=args.threeftx_max,
+            percent=args.percent,
             timeout=args.timeout,
             batch_size=args.batch_size,
         )
@@ -608,6 +693,7 @@ def main() -> None:
         _download_toxprot(
             args.output_dir,
             max_sequences=args.toxprot_max,
+            percent=args.percent,
             timeout=args.timeout,
             batch_size=args.batch_size,
         )
@@ -615,24 +701,26 @@ def main() -> None:
         _download_pla2g2(
             args.output_dir,
             max_sequences=args.pla2g2_max,
+            percent=args.percent,
             timeout=args.timeout,
         )
     if "cath_s40" in selected:
         _download_cath_s40(
             args.output_dir,
             max_sequences=args.cath_max,
+            percent=args.percent,
             timeout=args.timeout,
         )
     if "swissprot_rr" in selected:
         _download_swissprot(
             args.output_dir,
             max_sequences=args.swissprot_max,
+            percent=args.percent,
             timeout=args.timeout,
             batch_size=args.batch_size,
             identity=args.swissprot_identity,
         )
 
-    _ensure_output_folders(selected)
     if args.embed_h5:
         _embed_all_selected(
             args.output_dir,

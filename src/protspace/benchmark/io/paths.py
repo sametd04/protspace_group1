@@ -16,10 +16,13 @@ class BenchmarkPaths:
 
     data: str
     project_root: Path
+    dataset_dir: Path
     embedding_path: Path
     bundle_path: Path
+    results_dir: Path
     output_dir: Path
     output_png: Path
+    benchmark_bundle_path: Path
 
     @property
     def headers_npy(self) -> Path:
@@ -41,44 +44,21 @@ def benchmark_paths(data: str | None = None) -> BenchmarkPaths:
     """
     d = (data or os.environ.get("DATA", "3ftx")).strip()
     project_root = Path(__file__).resolve().parent.parent.parent.parent.parent
-    out = Path(__file__).resolve().parent.parent / "results" / d
-
-    output_dataset_dir = project_root / f"output_{d}"
-
-    # Look for data in data/{dataset}/ directory.
-    # Dataset name might be capitalized (e.g., 3FTx vs 3ftx).
     data_dir = project_root / "data"
-    data_dataset_dir = None
+    results_dir = Path(__file__).resolve().parent.parent / "results" / d
 
-    # Try exact match first, then case-insensitive
-    if (data_dir / d).exists():
-        data_dataset_dir = data_dir / d
-    else:
-        # Try to find case-insensitive match
+    dataset_dir = data_dir / d
+    if not dataset_dir.exists() and data_dir.exists():
+        # Fallback for case variants (e.g., 3FTx)
         for item in data_dir.iterdir():
             if item.is_dir() and item.name.lower() == d.lower():
-                data_dataset_dir = item
+                dataset_dir = item
                 break
 
-    # Prefer location that actually contains embeddings, with output_<dataset>
-    # taking priority because this is where benchmark embedding generation writes.
-    output_embedding = output_dataset_dir / "tmp" / "prot_t5.h5"
-    data_embedding = (
-        data_dataset_dir / "tmp" / "prot_t5.h5" if data_dataset_dir is not None else None
-    )
+    benchmark_bundle_path = results_dir / "benchmark.parquetbundle"
 
-    if output_embedding.exists():
-        dataset_dir = output_dataset_dir
-    elif data_embedding is not None and data_embedding.exists():
-        dataset_dir = data_dataset_dir
-    elif output_dataset_dir.exists():
-        dataset_dir = output_dataset_dir
-    elif data_dataset_dir is not None:
-        dataset_dir = data_dataset_dir
-    else:
-        dataset_dir = output_dataset_dir
-
-    # Look for bundle in parquetbundle subdirectory or directly
+    # Look for source labels in data/<dataset>, with a fallback to an existing
+    # benchmark bundle in results/<dataset>.
     bundle_path = None
     if (dataset_dir / "parquetbundle").exists():
         # Find first .parquetbundle file in parquetbundle/ directory
@@ -88,15 +68,20 @@ def benchmark_paths(data: str | None = None) -> BenchmarkPaths:
     elif (dataset_dir / "data.parquetbundle").exists():
         bundle_path = dataset_dir / "data.parquetbundle"
 
-    if bundle_path is None:
+    if bundle_path is None and benchmark_bundle_path.exists():
+        bundle_path = benchmark_bundle_path
+    elif bundle_path is None:
         # Default fallback
         bundle_path = dataset_dir / "data.parquetbundle"
 
     return BenchmarkPaths(
         data=d,
         project_root=project_root,
-        embedding_path=dataset_dir / "tmp" / "prot_t5.h5",
+        dataset_dir=dataset_dir,
+        embedding_path=dataset_dir / "prot_t5.h5",
         bundle_path=bundle_path,
-        output_dir=out,
-        output_png=out / f"projections_{d}.png",
+        results_dir=results_dir,
+        output_dir=results_dir,
+        output_png=results_dir / f"projections_{d}.png",
+        benchmark_bundle_path=benchmark_bundle_path,
     )

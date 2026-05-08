@@ -30,7 +30,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--plot",
         action="store_true",
-        help="After benchmarking, write projections_<DATA>.png",
+        help=(
+            "After benchmarking, write normalization_comparison.png in "
+            "src/protspace/benchmark/results/<DATA>/"
+        ),
     )
     parser.add_argument(
         "--plot-only",

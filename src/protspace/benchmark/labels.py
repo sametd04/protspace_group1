@@ -24,12 +24,15 @@ if TYPE_CHECKING:
     from protspace.benchmark.io.paths import BenchmarkPaths
 
 import io
+import logging
 from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
 
 from protspace.data.io.bundle import read_bundle
+
+logger = logging.getLogger(__name__)
 
 # Generic, structural, or methodological UniProt keywords that don't
 # describe a protein's function. Filtered out so the first remaining
@@ -112,10 +115,56 @@ def load_labels_from_bundle(
     parquets, _ = read_bundle(bundle_path)
     ann = pq.read_table(io.BytesIO(parquets[0])).to_pandas()
 
+    return _labels_from_annotations_frame(
+        ann,
+        headers=headers,
+        column=column,
+        filter_keywords=filter_keywords,
+        min_class_size=min_class_size,
+        source=bundle_path,
+    )
+
+
+def load_labels_from_parquet(
+    parquet_path: Path | str,
+    headers: list[str],
+    column: str = "keyword",
+    filter_keywords: bool = True,
+    min_class_size: int = 3,
+) -> np.ndarray:
+    """Load categorical labels from a parquet annotation table."""
+    parquet_path = Path(parquet_path)
+    ann = pq.read_table(parquet_path).to_pandas()
+    return _labels_from_annotations_frame(
+        ann,
+        headers=headers,
+        column=column,
+        filter_keywords=filter_keywords,
+        min_class_size=min_class_size,
+        source=parquet_path,
+    )
+
+
+def _labels_from_annotations_frame(
+    ann,
+    headers: list[str],
+    column: str,
+    filter_keywords: bool,
+    min_class_size: int,
+    source: Path,
+) -> np.ndarray:
+    """Extract labels from a protein annotation table."""
     if column not in ann.columns:
         raise ValueError(
-            f"Column '{column}' not found in {bundle_path}. "
+            f"Column '{column}' not found in {source}. "
             f"Available: {sorted(ann.columns)}"
+        )
+
+    id_column = "protein_id" if "protein_id" in ann.columns else "identifier"
+    if id_column not in ann.columns:
+        raise ValueError(
+            f"No protein identifier column found in {source}. "
+            "Expected one of ['protein_id', 'identifier']."
         )
 
     if filter_keywords and column == "keyword":
@@ -129,7 +178,7 @@ def load_labels_from_bundle(
         if small:
             ann.loc[ann["_label"].isin(small), "_label"] = None
 
-    id_to_label = dict(zip(ann["protein_id"], ann["_label"], strict=False))
+    id_to_label = dict(zip(ann[id_column], ann["_label"], strict=False))
     return np.array([id_to_label.get(h) for h in headers], dtype=object)
 
 
@@ -139,7 +188,10 @@ def load_silhouette_labels(
     """Load labels for silhouette metric from bundle.
 
     Convenience wrapper around load_labels_from_bundle for benchmark pipeline.
-    Returns None if bundle doesn't exist (graceful degradation).
+    Looks up labels in this order:
+    1. Dataset bundle / benchmark bundle (`paths.bundle_path`)
+    2. Dataset tmp annotations parquet (`data/<dataset>/tmp/all_annotations.parquet`)
+    Returns None if neither source provides usable labels.
 
     Parameters
     ----------
@@ -152,9 +204,28 @@ def load_silhouette_labels(
     -------
     Label array or None if bundle unavailable.
     """
-    if not paths.bundle_path.exists():
-        return None
-    return load_labels_from_bundle(paths.bundle_path, headers)
+    annotation_errors: list[str] = []
+
+    if paths.bundle_path.exists():
+        try:
+            return load_labels_from_bundle(paths.bundle_path, headers)
+        except ValueError as exc:
+            annotation_errors.append(str(exc))
+
+    tmp_annotations = paths.dataset_dir / "tmp" / "all_annotations.parquet"
+    if tmp_annotations.exists():
+        try:
+            return load_labels_from_parquet(tmp_annotations, headers)
+        except ValueError as exc:
+            annotation_errors.append(str(exc))
+
+    if annotation_errors:
+        logger.warning(
+            "Skipping silhouette labels for %s: %s",
+            paths.data,
+            " | ".join(annotation_errors),
+        )
+    return None
 
 
 def label_summary(labels: np.ndarray) -> dict[str, int | dict[str, int]]:

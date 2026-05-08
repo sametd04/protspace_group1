@@ -12,15 +12,25 @@
 /docs/publication
 
 # --- data ---
-# Ignore all data directories except 3FTx, Pla2g2, and toxins
+# Ignore all data directories except curated dataset folders
 /data/*
 !/data/3FTx
 !/data/Pla2g2
 !/data/toxins
+!/data/3ftx/
+!/data/toxprot/
+!/data/pla2g2/
+!/data/cath_s40/
+!/data/swissprot_rr/
 # Always ignore pdb subdirectories, tmp subdirectories, .h5 files, and generated projections
 **/pdb/
 **/tmp/
 **/*.h5
+!/data/3ftx/*.h5
+!/data/toxprot/*.h5
+!/data/pla2g2/*.h5
+!/data/cath_s40/*.h5
+!/data/swissprot_rr/*.h5
 **/*.npy
 
 # Python bytecode

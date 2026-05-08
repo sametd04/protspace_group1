@@ -56,8 +56,8 @@ def run_benchmark(paths: BenchmarkPaths) -> None:
     if not paths.embedding_path.exists():
         sys.exit(
             f"Embeddings not found at {paths.embedding_path}.\n"
-            f"Generate with: protspace prepare -q '<query>' "
-            f"-e prot_t5 -m pca2,umap2 -o output_{paths.data}"
+            f"Generate with: uv run python scripts/download_project_datasets.py "
+            f"--datasets {paths.data}"
         )
 
     emb_set = load_h5([paths.embedding_path])
@@ -210,14 +210,16 @@ def run_benchmark(paths: BenchmarkPaths) -> None:
     print(f"Data table: {len(data_table)} rows")
 
     # Write bundle
-    bundle_path = paths.output_dir / "benchmark.parquetbundle"
-    print(f"Writing bundle to {bundle_path}...")
-    write_bundle([annotations_table, metadata_table, data_table], bundle_path)
+    paths.benchmark_bundle_path.parent.mkdir(exist_ok=True, parents=True)
+    print(f"Writing bundle to {paths.benchmark_bundle_path}...")
+    write_bundle(
+        [annotations_table, metadata_table, data_table], paths.benchmark_bundle_path
+    )
     print("Bundle written successfully!")
 
     print(f"\nProjections saved to {paths.output_dir}/")
     print(f"Metrics saved to {metrics_csv}")
-    print(f"\nVisualize with: protspace serve {bundle_path}")
+    print(f"\nVisualize with: protspace serve {paths.benchmark_bundle_path}")
     print("=" * 70)
 
 

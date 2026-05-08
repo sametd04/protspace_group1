@@ -8,7 +8,11 @@ Benchmark dimensionality reduction methods on protein embeddings with timing and
 # Install dependencies
 uv sync --extra benchmark
 
-# Run benchmark with visualization
+# Run benchmark with visualization (dataset selectable via --dataset)
+uv run python -m protspace.benchmark.run --dataset 3ftx
+uv run python -m protspace.benchmark.run --dataset toxprot
+
+# Alternative benchmark CLI wrapper
 uv run python -m protspace.benchmark.cli --data 3ftx --plot
 
 # Visualize existing results
@@ -16,11 +20,24 @@ uv run python -m protspace.benchmark.cli --data 3ftx --plot-only
 ```
 
 This will:
-- Load embeddings from `data/3ftx/tmp/prot_t5.h5`
+- Load embeddings from `data/3ftx/prot_t5.h5`
 - Run all 6 DR methods (PCA, UMAP, t-SNE, PaCMAP, MDS, LocalMAP) twice (normalized & raw)
 - Calculate trustworthiness and silhouette scores (if labels available)
 - Save metrics to `src/protspace/benchmark/results/3ftx/metrics.csv`
-- Generate side-by-side comparison plots: `normalization_comparison.png`
+- Generate side-by-side comparison plots in `src/protspace/benchmark/results/3ftx/`
+
+## How benchmark execution works
+
+`run.py` executes this pipeline per dataset:
+1. Read embeddings from `data/<dataset>/prot_t5.h5`
+2. Optionally read annotation labels from a source `.parquetbundle` (for silhouette)
+3. Run all DR methods and compute metrics
+4. Write outputs to `src/protspace/benchmark/results/<dataset>/`
+
+Persistence model:
+- Results are file-based only (`metrics.csv`, plots, `benchmark.parquetbundle`)
+- No database or hidden state is used by the benchmark pipeline
+- Input embeddings remain in `data/<dataset>/` and are not moved
 
 ## Python API
 
@@ -122,16 +139,20 @@ src/protspace/benchmark/
 ├── io/                   # I/O utilities
 │   ├── paths.py          # Path resolution
 │   └── headers.py        # Header resolution
-└── results/              # Outputs (auto-created)
+└── results/              # Generated benchmark outputs
     └── <dataset>/
         ├── metrics.csv
         ├── normalization_comparison.png
         ├── normalization_comparison.pdf
         └── benchmark.parquetbundle
+
+data/
+└── <dataset>/            # Dataset-local outputs
+    └── prot_t5.h5        # Input embeddings only
 ```
 
 ## Output Files
 
-- `metrics.csv` - Runtime and quality metrics per method
-- `normalization_comparison.png/pdf` - Side-by-side visualizations
-- `benchmark.parquetbundle` - Web visualization bundle (optional)
+- `src/protspace/benchmark/results/<dataset>/metrics.csv` - Runtime and quality metrics per method
+- `src/protspace/benchmark/results/<dataset>/normalization_comparison.png/pdf` - Side-by-side visualizations
+- `src/protspace/benchmark/results/<dataset>/benchmark.parquetbundle` - Web bundle (persisted result dataset)
