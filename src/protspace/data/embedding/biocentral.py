@@ -277,10 +277,15 @@ def embed_sequences(
                 )
                 task.MAX_CONSECUTIVE_FAILURES = cfg.max_consecutive_poll_failures
                 result = task.run_with_progress()
+                emb_dict = result.to_dict() if result is not None else None
+                if not isinstance(emb_dict, dict) and hasattr(task, "run"):
+                    # Backward compatibility for clients/tests that expose run()
+                    # but not a functional run_with_progress() return contract.
+                    result = task.run()
+                    emb_dict = result.to_dict() if result is not None else None
 
             if result is not None:
-                emb_dict = result.to_dict()
-                if emb_dict:
+                if isinstance(emb_dict, dict) and emb_dict:
                     # Expand embeddings to all IDs sharing the same sequence
                     expanded: dict[str, np.ndarray] = {}
                     for rep_id, emb in emb_dict.items():
@@ -297,6 +302,12 @@ def embed_sequences(
                             batch_idx + 1,
                             len(missing_reps),
                         )
+                elif emb_dict is None:
+                    logger.error(
+                        "Batch %d/%d: API returned no embeddings payload",
+                        batch_idx + 1,
+                        len(api_batches),
+                    )
             else:
                 failed_batches += 1
                 logger.error(
