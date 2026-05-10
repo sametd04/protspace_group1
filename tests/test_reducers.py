@@ -19,6 +19,13 @@ from protspace.utils.reducers import (
     UMAPReducer,
 )
 
+try:
+    from protspace.utils.reducers import PPCAReducer
+
+    HAS_PPCA = True
+except ImportError:
+    HAS_PPCA = False
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -170,6 +177,93 @@ class TestLocalMAPReducer:
 
 
 # ---------------------------------------------------------------------------
+# ρPCA tests (skipped until PPCAReducer is implemented)
+# ---------------------------------------------------------------------------
+
+ppca_skip = pytest.mark.skipif(not HAS_PPCA, reason="PPCAReducer not yet implemented")
+
+
+@ppca_skip
+class TestPPCAReducer:
+    @pytest.fixture
+    def ppca_config_2d(self):
+        return DimensionReductionConfig(
+            n_components=2,
+            random_state=SEED,
+            background_ratio=0.3,
+            background_strategy="random",
+        )
+
+    @pytest.fixture
+    def ppca_config_3d(self):
+        return DimensionReductionConfig(
+            n_components=3,
+            random_state=SEED,
+            background_ratio=0.3,
+            background_strategy="random",
+        )
+
+    def test_output_shape_2d(self, data_2d, ppca_config_2d):
+        result = PPCAReducer(ppca_config_2d).fit_transform(data_2d)
+        assert result.shape == (N_SAMPLES, 2)
+
+    def test_output_shape_3d(self, data_3d, ppca_config_3d):
+        result = PPCAReducer(ppca_config_3d).fit_transform(data_3d)
+        assert result.shape == (N_SAMPLES, 3)
+
+    def test_no_nan_values(self, data_2d, ppca_config_2d):
+        result = PPCAReducer(ppca_config_2d).fit_transform(data_2d)
+        assert not np.isnan(result).any()
+
+    def test_deterministic(self, data_2d, ppca_config_2d):
+        r1 = PPCAReducer(ppca_config_2d).fit_transform(data_2d)
+        r2 = PPCAReducer(ppca_config_2d).fit_transform(data_2d)
+        np.testing.assert_allclose(r1, r2, atol=1e-5)
+
+    def test_get_params(self, data_2d, ppca_config_2d):
+        reducer = PPCAReducer(ppca_config_2d)
+        reducer.fit_transform(data_2d)
+        params = reducer.get_params()
+        assert params["n_components"] == 2
+        assert "regularization_mu" in params
+        assert "background_ratio" in params
+        assert "background_strategy" in params
+        assert "eigenvalue_ratios" in params
+
+    def test_background_strategies(self, data_2d):
+        for strategy in ("random", "uniform", "outlier"):
+            config = DimensionReductionConfig(
+                n_components=2,
+                random_state=SEED,
+                background_ratio=0.3,
+                background_strategy=strategy,
+            )
+            result = PPCAReducer(config).fit_transform(data_2d)
+            assert result.shape == (N_SAMPLES, 2)
+            assert np.isfinite(result).all(), f"strategy={strategy} produced non-finite"
+
+    def test_regularization(self, data_2d):
+        config = DimensionReductionConfig(
+            n_components=2,
+            random_state=SEED,
+            background_ratio=0.3,
+            background_strategy="random",
+            regularization_mu=0.1,
+        )
+        result = PPCAReducer(config).fit_transform(data_2d)
+        assert result.shape == (N_SAMPLES, 2)
+        assert np.isfinite(result).all()
+
+    def test_eigenvalue_ratios(self, data_2d, ppca_config_2d):
+        reducer = PPCAReducer(ppca_config_2d)
+        reducer.fit_transform(data_2d)
+        ratios = reducer.get_params()["eigenvalue_ratios"]
+        assert len(ratios) == 2
+        assert all(r > 0 for r in ratios), "eigenvalue ratios must be positive"
+        assert ratios[0] >= ratios[1], "eigenvalue ratios must be descending"
+
+
+# ---------------------------------------------------------------------------
 # Cross-cutting tests
 # ---------------------------------------------------------------------------
 
@@ -181,6 +275,9 @@ ALL_REDUCERS = [
     ("mds", MDSReducer),
     ("localmap", LocalMAPReducer),
 ]
+
+if HAS_PPCA:
+    ALL_REDUCERS.append(("ppca", PPCAReducer))
 
 
 @pytest.mark.parametrize("name,cls", ALL_REDUCERS, ids=[r[0] for r in ALL_REDUCERS])
@@ -270,3 +367,21 @@ class TestProcessorReduction:
             assert result["dimensions"] == 2
             assert isinstance(result["name"], str)
             assert isinstance(result["info"], dict)
+
+    @pytest.mark.skipif(not HAS_PPCA, reason="PPCAReducer not yet implemented")
+    def test_ppca_through_processor(self, data_2d):
+        from protspace.data.processors.base_processor import BaseProcessor
+        from protspace.utils import get_reducers
+
+        REDUCERS = get_reducers()
+
+        processor = BaseProcessor(
+            {"random_state": SEED, "background_ratio": 0.3, "background_strategy": "random", "regularization_mu": 0.0},
+            REDUCERS,
+        )
+        result = processor.process_reduction(data_2d, "ppca", 2)
+        assert result["data"].shape == (N_SAMPLES, 2)
+        assert np.isfinite(result["data"]).all()
+        assert result["dimensions"] == 2
+        assert isinstance(result["name"], str)
+        assert isinstance(result["info"], dict)
