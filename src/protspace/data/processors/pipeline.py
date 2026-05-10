@@ -42,6 +42,9 @@ class ReducerParams:
     n_init: int = 4
     max_iter: int = 300
     eps: float = 1e-6
+    regularization_mu: float = 0.0
+    background_ratio: float = 0.3
+    background_strategy: str = "random"
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,7 @@ def parse_method_spec(method_spec: str) -> MethodSpec:
     Examples:
         'pca2'                              → MethodSpec('pca', 2)
         'umap2:n_neighbors=50;min_dist=0.1' → MethodSpec('umap', 2, overrides=...)
+        'ppca2:background_ratio=0.4'        → MethodSpec('ppca', 2, overrides=...)
     """
     # Split on first ':' to separate method from overrides
     if ":" in method_spec:
