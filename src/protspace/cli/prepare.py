@@ -18,7 +18,10 @@ import typer
 
 from protspace.cli.app import app, setup_logging
 from protspace.cli.common_options import (
+    BackgroundStrategy,
     Metric,
+    Opt_BackgroundRatio,
+    Opt_BackgroundStrategy,
     Opt_BatchSize,
     Opt_Eps,
     Opt_Fasta,
@@ -33,6 +36,7 @@ from protspace.cli.common_options import (
     Opt_NNeighbors,
     Opt_Perplexity,
     Opt_RandomState,
+    Opt_RegularizationMu,
     Opt_Similarity,
     Opt_Verbose,
 )
@@ -287,6 +291,10 @@ def prepare(
     n_init: Opt_NInit = 4,
     max_iter: Opt_MaxIter = 300,
     eps: Opt_Eps = 1e-3,
+    # ρPCA-specific options. These are global defaults
+    regularization_mu: Opt_RegularizationMu = 0.0,
+    background_ratio: Opt_BackgroundRatio = 0.3,
+    background_strategy: Opt_BackgroundStrategy = BackgroundStrategy.random,
     # Annotations
     annotations: Opt_Annotations = None,
     scores: Opt_Scores = True,
@@ -498,6 +506,9 @@ def prepare(
             n_init=n_init,
             max_iter=max_iter,
             eps=eps,
+            regularization_mu=regularization_mu,
+            background_ratio=background_ratio,
+            background_strategy=background_strategy.value,
         )
         config = PipelineConfig(
             methods=method_specs,
