@@ -16,6 +16,18 @@ class Metric(str, Enum):
     manhattan = "manhattan"
 
 
+class BackgroundStrategy(str, Enum):
+    """Sampling policy for the ρPCA background set.
+
+    Mirrors ``BACKGROUND_STRATEGY_TYPES`` in ``utils/constants.py``; keep
+    the two in sync.
+    """
+
+    random = "random"
+    uniform = "uniform"
+    outlier = "outlier"
+
+
 # ---------------------------------------------------------------------------
 # Shared option types
 # ---------------------------------------------------------------------------
@@ -109,6 +121,42 @@ Opt_MaxIter = Annotated[
 Opt_Eps = Annotated[
     float,
     typer.Option(help="MDS convergence tolerance.", rich_help_panel="Projection"),
+]
+
+# ρPCA-specific option
+Opt_RegularizationMu = Annotated[
+    float,
+    typer.Option(
+        "--regularization-mu",
+        help=(
+            "ρPCA Tikhonov regularization μ added to the background covariance "
+            "Σ_B to stabilize the generalized eigenproblem when Σ_B is ill-"
+            "conditioned. Must be ≥ 0."
+        ),
+        rich_help_panel="Projection",
+        min=0.0,
+    ),
+]
+Opt_BackgroundRatio = Annotated[
+    float,
+    typer.Option(
+        "--background-ratio",
+        help=(
+            "ρPCA fraction of input samples used to form the background set. "
+            "Must lie strictly in (0, 1)."
+        ),
+        rich_help_panel="Projection",
+        min=0.0,
+        max=1.0,
+    ),
+]
+Opt_BackgroundStrategy = Annotated[
+    BackgroundStrategy,
+    typer.Option(
+        "--background-strategy",
+        help="ρPCA background-sampling policy.",
+        rich_help_panel="Projection",
+    ),
 ]
 
 # Embedding options (shared by prepare and embed)
