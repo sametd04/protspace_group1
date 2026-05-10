@@ -13,11 +13,23 @@ UMAP_NAME = "umap"
 PACMAP_NAME = "pacmap"
 MDS_NAME = "mds"
 LOCALMAP_NAME = "localmap"
+PPCA_NAME = "ppca"
 
-REDUCER_METHODS = [PCA_NAME, TSNE_NAME, UMAP_NAME, PACMAP_NAME, MDS_NAME, LOCALMAP_NAME]
+REDUCER_METHODS = [
+    PCA_NAME,
+    TSNE_NAME,
+    UMAP_NAME,
+    PACMAP_NAME,
+    MDS_NAME,
+    LOCALMAP_NAME,
+    PPCA_NAME,
+]
 
 # Metric types
 METRIC_TYPES = Literal["euclidean", "cosine"]
+
+# ρPCA background selection strategies
+BACKGROUND_STRATEGY_TYPES = Literal["random", "uniform", "outlier"]
 
 
 @dataclass(frozen=True)
@@ -38,6 +50,14 @@ class DimensionReductionConfig:
         max_iter: Maximum iterations (>0)
         eps: Convergence tolerance (>0)
         random_state: Random seed for reproducibility (>= 0)
+        regularization_mu: Tikhonov regularization added to the background
+            covariance Σ_B in ρPCA to stabilize the generalized eigenproblem
+            when Σ_B is singular or ill-conditioned (>= 0)
+        background_ratio: Fraction of samples drawn from the input data to
+            form the background set in ρPCA. Must lie strictly in (0, 1) to
+            ensure both target and background sets are non-empty.
+        background_strategy: Sampling policy used to construct the background
+            set in ρPCA. One of {"random", "uniform", "outlier"}.
     """
 
     n_components: int = field(default=2, metadata={"allowed": [2, 3]})
@@ -56,6 +76,14 @@ class DimensionReductionConfig:
     eps: float = field(default=1e-3, metadata={"gt": 0})
     random_state: int = field(default=42, metadata={"gte": 0})
 
+    # ρPCA-specific parameters
+    regularization_mu: float = field(default=0.0, metadata={"gte": 0})
+    background_ratio: float = field(default=0.3, metadata={"gt": 0, "lt": 1})
+    background_strategy: BACKGROUND_STRATEGY_TYPES = field(
+        default="random",
+        metadata={"allowed": list(get_args(BACKGROUND_STRATEGY_TYPES))},
+    )
+
     def __post_init__(self):
         """Validate configuration parameters."""
         for data_field in fields(self):
@@ -67,25 +95,21 @@ class DimensionReductionConfig:
                     raise ValueError(
                         f"{data_field.name} must be one of {metadata['allowed']}"
                     )
-
             if "gt" in metadata:
                 if value <= metadata["gt"]:
                     raise ValueError(
                         f"{data_field.name} must be greater than {metadata['gt']}"
                     )
-
             if "lt" in metadata:
                 if value >= metadata["lt"]:
                     raise ValueError(
                         f"{data_field.name} must be less than {metadata['lt']}"
                     )
-
             if "gte" in metadata:
                 if value < metadata["gte"]:
                     raise ValueError(
                         f"{data_field.name} must be greater than or equal to {metadata['gte']}"
                     )
-
             if "lte" in metadata:
                 if value > metadata["lte"]:
                     raise ValueError(
