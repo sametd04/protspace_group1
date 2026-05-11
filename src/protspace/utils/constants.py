@@ -28,8 +28,11 @@ REDUCER_METHODS = [
 # Metric types
 METRIC_TYPES = Literal["euclidean", "cosine"]
 
-# ρPCA background selection strategies
-BACKGROUND_STRATEGY_TYPES = Literal["random", "uniform", "outlier"]
+# ρPCA background selection strategies.
+# "external" is selected automatically when a background dataset is provided
+# via --ppca-background; the other three are auto-split policies on the
+# target data and are useful when no external background exists.
+BACKGROUND_STRATEGY_TYPES = Literal["external", "random", "uniform", "outlier"]
 
 
 @dataclass(frozen=True)
@@ -50,14 +53,21 @@ class DimensionReductionConfig:
         max_iter: Maximum iterations (>0)
         eps: Convergence tolerance (>0)
         random_state: Random seed for reproducibility (>= 0)
-        regularization_mu: Tikhonov regularization added to the background
-            covariance Σ_B in ρPCA to stabilize the generalized eigenproblem
-            when Σ_B is singular or ill-conditioned (>= 0)
-        background_ratio: Fraction of samples drawn from the input data to
-            form the background set in ρPCA. Must lie strictly in (0, 1) to
-            ensure both target and background sets are non-empty.
-        background_strategy: Sampling policy used to construct the background
-            set in ρPCA. One of {"random", "uniform", "outlier"}.
+        regularization_mu: Tikhonov μ added to Σ_B before solving the
+            ρPCA generalized eigenproblem (>= 0). Required (> 0) whenever
+            n_background <= n_features.
+        background_ratio: Fraction of target samples drawn as background
+            in auto-split modes. Ignored when background_strategy =
+            "external". Must lie strictly in (0, 1).
+        background_strategy: Background construction policy.
+            "external" uses the dataset passed via background_data (set by
+            the pipeline from --ppca-background); the auto-split policies
+            "random", "uniform", "outlier" partition the target data.
+        standard_scale: If True, per-set standard-scale (column mean 0,
+            unit variance) target and background matrices before computing
+            covariances. Matches the Carilli/Jackson/Pachter convention.
+            Strongly recommended for PLM embeddings whose dimensions have
+            heterogeneous scale.
     """
 
     n_components: int = field(default=2, metadata={"allowed": [2, 3]})
@@ -77,12 +87,13 @@ class DimensionReductionConfig:
     random_state: int = field(default=42, metadata={"gte": 0})
 
     # ρPCA-specific parameters
-    regularization_mu: float = field(default=0.0, metadata={"gte": 0})
+    regularization_mu: float = field(default=1e-3, metadata={"gte": 0})
     background_ratio: float = field(default=0.3, metadata={"gt": 0, "lt": 1})
     background_strategy: BACKGROUND_STRATEGY_TYPES = field(
-        default="random",
+        default="outlier",
         metadata={"allowed": list(get_args(BACKGROUND_STRATEGY_TYPES))},
     )
+    standard_scale: bool = field(default=True)
 
     def __post_init__(self):
         """Validate configuration parameters."""

@@ -24,9 +24,11 @@ from protspace.cli.common_options import (
     Opt_NInit,
     Opt_NNeighbors,
     Opt_Perplexity,
+    Opt_PpcaBackground,
     Opt_RandomState,
     Opt_RegularizationMu,
     Opt_Similarity,
+    Opt_StandardScale,
     Opt_Verbose,
 )
 
@@ -63,9 +65,11 @@ def project(
     n_init: Opt_NInit = 4,
     max_iter: Opt_MaxIter = 300,
     eps: Opt_Eps = 1e-3,
-    regularization_mu: Opt_RegularizationMu = 0.0,
+    regularization_mu: Opt_RegularizationMu = 1e-3,
     background_ratio: Opt_BackgroundRatio = 0.3,
-    background_strategy: Opt_BackgroundStrategy = BackgroundStrategy.random,
+    background_strategy: Opt_BackgroundStrategy = BackgroundStrategy.outlier,
+    ppca_background: Opt_PpcaBackground = None,
+    standard_scale: Opt_StandardScale = True,
     verbose: Opt_Verbose = 0,
 ) -> None:
     """Run dimensionality reduction on HDF5 embeddings.
@@ -86,12 +90,13 @@ def project(
     from protspace.data.processors.base_processor import BaseProcessor
     from protspace.data.processors.pipeline import (
         ReducerParams,
+        _load_background_h5,
         _run_with_overridden_config,
         disambiguation_suffix,
         parse_methods_arg,
     )
     from protspace.utils import get_reducers
-    from protspace.utils.constants import MDS_NAME
+    from protspace.utils.constants import MDS_NAME, PPCA_NAME
 
     input_specs = _parse_input_specs(input)
     embedding_sets: list[EmbeddingSet] = []
@@ -112,6 +117,12 @@ def project(
 
     method_specs = parse_methods_arg(methods or ["pca2"])
 
+    # Resolve external background early so we can warn upfront and load once.
+    bg_path_str = str(ppca_background) if ppca_background else ""
+    bg_data = None
+    if bg_path_str:
+        bg_data = _load_background_h5(Path(bg_path_str))
+
     reducer_params = ReducerParams(
         metric=metric.value,
         random_state=random_state,
@@ -127,16 +138,18 @@ def project(
         regularization_mu=regularization_mu,
         background_ratio=background_ratio,
         background_strategy=background_strategy.value,
+        standard_scale=standard_scale,
+        background_path=bg_path_str,
     )
     global_params = asdict(reducer_params)
     reducers = get_reducers()
     base = BaseProcessor(global_params, reducers)
 
-    # Pre-compute which (method, dims) pairs appear multiple times
     method_counts = Counter((s.method, s.dims) for s in method_specs)
 
     all_reductions = []
     headers = embedding_sets[0].headers
+    ppca_warned = False
     for emb_set in embedding_sets:
         for spec in method_specs:
             method, dims = spec.method, spec.dims
@@ -152,6 +165,22 @@ def project(
             effective_params = {**global_params, **spec.overrides_dict}
             if emb_set.precomputed:
                 effective_params["precomputed"] = True
+
+            # ρPCA: route external background, warn on fallback.
+            if method == PPCA_NAME:
+                if bg_data is not None:
+                    effective_params["background_strategy"] = "external"
+                    effective_params["background_data"] = bg_data
+                elif not ppca_warned:
+                    logger.warning(
+                        "ρPCA: no external background provided via "
+                        "--ppca-background; falling back to auto-split "
+                        "strategy '%s'. Results are usually inferior to "
+                        "a true contrastive background.",
+                        effective_params.get("background_strategy"),
+                    )
+                    ppca_warned = True
+            effective_params.pop("background_path", None)
 
             logger.info(f"Applying {method.upper()}{dims} to '{emb_set.name}'")
             reduction = _run_with_overridden_config(
