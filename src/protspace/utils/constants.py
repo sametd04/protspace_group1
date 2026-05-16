@@ -1,4 +1,4 @@
-"""Lightweight constants and config — no heavy dependencies (sklearn, umap, pacmap).
+"""Lightweight constants and config — no heavy dependencies.
 
 Import this module freely without triggering numba/pynndescent compilation.
 """
@@ -17,63 +17,40 @@ PPCA_NAME = "ppca"
 KPPCA_NAME = "kppca"
 
 REDUCER_METHODS = [
-    PCA_NAME,
-    TSNE_NAME,
-    UMAP_NAME,
-    PACMAP_NAME,
-    MDS_NAME,
-    LOCALMAP_NAME,
-    PPCA_NAME,
-    KPPCA_NAME
+    PCA_NAME, TSNE_NAME, UMAP_NAME, PACMAP_NAME,
+    MDS_NAME, LOCALMAP_NAME, PPCA_NAME, KPPCA_NAME,
 ]
 
-# Metric types
+# Distance metric types
 METRIC_TYPES = Literal["euclidean", "cosine"]
 
-# ρPCA background selection strategies. "external" is selected automatically
-# when a background dataset is provided via --ppca-background; the other three
-# are auto-split policies on the target data.
-BACKGROUND_STRATEGY_TYPES = Literal["external", "random", "uniform", "outlier"]
+# ρPCA background construction strategies (paper-grounded; replaces the
+# deprecated auto-split policies random/uniform/outlier which violated the
+# ρPCA premise that Σ_B must estimate a *different* distribution than Σ_T).
+#
+#   pool            — entire external pool (canonical Mode 1, Carilli 2025)
+#   complement      — input \ target, split by annotation column
+#   length_matched  — pool sub-sample with matched length distribution
+#   stratified      — pool sub-sample stratified by annotation columns
+#   mixed           — stratified by annotations AND/OR length bins
+BACKGROUND_STRATEGY_TYPES = Literal[
+    "pool", "complement", "length_matched", "stratified", "mixed",
+]
 
-# k-ρPCA kernel sources and kernel functions
+# k-ρPCA kernel sources and kernel functions (paper 2)
 KERNEL_SOURCE_TYPES = Literal["embedding", "similarity", "precomputed"]
 KERNEL_TYPES = Literal["gaussian", "inverse_distance", "linear"]
 
 
 @dataclass(frozen=True)
 class DimensionReductionConfig:
-    """Configuration for dimension reduction methods.
+    """Configuration for all dimension-reduction methods.
 
-    Parameters:
-        n_components: Number of dimensions in reduced space (2 or 3)
-        n_neighbors: Number of neighbors for manifold learning (>0)
-        metric: Distance metric to use
-        precomputed: Whether distances are precomputed
-        min_dist: Minimum distance for UMAP (0-1)
-        perplexity: Perplexity for t-SNE (5-50)
-        learning_rate: Learning rate for t-SNE optimization (>0)
-        mn_ratio: Ratio for PaCMAP (0-1)
-        fp_ratio: Ratio for PaCMAP (>0)
-        n_init: Number of initializations for MDS (>0)
-        max_iter: Maximum iterations (>0)
-        eps: Convergence tolerance (>0)
-        random_state: Random seed for reproducibility (>= 0)
-        regularization_mu: Tikhonov μ added to Σ_B before solving the
-            ρPCA generalized eigenproblem (>= 0). Required (> 0) whenever
-            n_background <= n_features.
-        background_ratio: Fraction of target samples drawn as background
-            in auto-split modes. Ignored when background_strategy =
-            "external". Must lie strictly in (0, 1).
-        background_strategy: Background construction policy.
-            "external" uses the dataset passed via background_data (set by
-            the pipeline from --ppca-background); the auto-split policies
-            "random", "uniform", "outlier" partition the target data.
-        standard_scale: If True, per-set standard-scale (column mean 0,
-            unit variance) target and background matrices before computing
-            covariances. Matches the Carilli/Jackson/Pachter convention.
-            Strongly recommended for PLM embeddings whose dimensions have
-            heterogeneous scale.
-        kernel, kernel_source, kernel_bandwidth and background_kernel: consumed by k-ρPCA
+    ρPCA-specific parameters: regularization_mu, background_strategy,
+    standard_scale, samples_per_target, n_length_bins.
+
+    k-ρPCA additionally consumes kernel, kernel_source, kernel_bandwidth,
+    background_kernel.
     """
 
     n_components: int = field(default=2, metadata={"allowed": [2, 3]})
@@ -94,12 +71,13 @@ class DimensionReductionConfig:
 
     # ρPCA parameters
     regularization_mu: float = field(default=1e-3, metadata={"gte": 0})
-    background_ratio: float = field(default=0.3, metadata={"gt": 0, "lt": 1})
     background_strategy: BACKGROUND_STRATEGY_TYPES = field(
-        default="outlier",
+        default="pool",
         metadata={"allowed": list(get_args(BACKGROUND_STRATEGY_TYPES))},
     )
     standard_scale: bool = field(default=True)
+    samples_per_target: int = field(default=3, metadata={"gt": 0})
+    n_length_bins: int = field(default=10, metadata={"gt": 0})
 
     # k-ρPCA parameters
     kernel: KERNEL_TYPES = field(
@@ -110,40 +88,20 @@ class DimensionReductionConfig:
         default="embedding",
         metadata={"allowed": list(get_args(KERNEL_SOURCE_TYPES))},
     )
-    # kernel_bandwidth=0 means "auto" (sqrt(median pairwise distance), the
-    # rhopca reference heuristic). Any positive value is used literally.
     kernel_bandwidth: float = field(default=0.0, metadata={"gte": 0})
     background_kernel: bool = field(default=False)
-    
 
     def __post_init__(self):
-        """Validate configuration parameters."""
-        for data_field in fields(self):
-            value = getattr(self, data_field.name)
-            metadata = data_field.metadata
-
-            if "allowed" in metadata:
-                if value not in metadata["allowed"]:
-                    raise ValueError(
-                        f"{data_field.name} must be one of {metadata['allowed']}"
-                    )
-            if "gt" in metadata:
-                if value <= metadata["gt"]:
-                    raise ValueError(
-                        f"{data_field.name} must be greater than {metadata['gt']}"
-                    )
-            if "lt" in metadata:
-                if value >= metadata["lt"]:
-                    raise ValueError(
-                        f"{data_field.name} must be less than {metadata['lt']}"
-                    )
-            if "gte" in metadata:
-                if value < metadata["gte"]:
-                    raise ValueError(
-                        f"{data_field.name} must be greater than or equal to {metadata['gte']}"
-                    )
-            if "lte" in metadata:
-                if value > metadata["lte"]:
-                    raise ValueError(
-                        f"{data_field.name} must be less than or equal to {metadata['lte']}"
-                    )
+        for f in fields(self):
+            value = getattr(self, f.name)
+            m = f.metadata
+            if "allowed" in m and value not in m["allowed"]:
+                raise ValueError(f"{f.name} must be one of {m['allowed']}")
+            if "gt" in m and value <= m["gt"]:
+                raise ValueError(f"{f.name} must be > {m['gt']}")
+            if "lt" in m and value >= m["lt"]:
+                raise ValueError(f"{f.name} must be < {m['lt']}")
+            if "gte" in m and value < m["gte"]:
+                raise ValueError(f"{f.name} must be ≥ {m['gte']}")
+            if "lte" in m and value > m["lte"]:
+                raise ValueError(f"{f.name} must be ≤ {m['lte']}")

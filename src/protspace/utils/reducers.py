@@ -533,7 +533,6 @@ class PPCAReducer(DimensionReducer):
 
         self.eigenvalues_ = top_eigvals
         self.eigenvectors_ = top_eigvecs
-        self.background_indices_ = bg_idx
         self.background_source_ = bg_source
 
         # Project the standardized target onto top eigenvectors.
@@ -541,53 +540,39 @@ class PPCAReducer(DimensionReducer):
     
 
     def _resolve_target_background(
-        self, data: np.ndarray, cfg
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, str]:
-        """Decide target and background matrices based on the background strategy.
+            self, data: np.ndarray, cfg
+        ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, str]:
+            """Pick the background matrix the pipeline prepared and stashed on cfg.
 
-        Returns (X_T, X_B, bg_indices_or_None, source_label).
-        """
-        background_data = getattr(cfg, "background_data", None)
-        strategy = str(cfg.background_strategy)
-        n_features = data.shape[1]
-
-        if strategy == "external":
+            The pipeline owns all the strategy logic now; the reducer's job is to
+            receive a ready-made X_target and X_background pair and solve the
+            eigenproblem on them.
+            """
+            background_data = getattr(cfg, "background_data", None)
             if background_data is None:
                 raise ValueError(
-                    "background_strategy='external' requires a background "
-                    "dataset via --ppca-background, but config.background_data "
-                    "is None."
+                    "ρPCA requires a prepared background. The pipeline should have "
+                    "attached cfg.background_data via build_background(); this is a "
+                    "configuration error. Pass --ppca-background and "
+                    "--ppca-strategy, or contact the developers."
                 )
+
             X_B = np.asarray(background_data, dtype=np.float64)
             if X_B.ndim != 2:
-                raise ValueError(f"External background must be 2D, got {X_B.shape}.")
-            if X_B.shape[1] != n_features:
+                raise ValueError(f"Background must be 2D, got {X_B.shape}.")
+            if X_B.shape[1] != data.shape[1]:
                 raise ValueError(
-                    f"External background has {X_B.shape[1]} features but "
-                    f"target has {n_features}. Same embedding model required."
+                    f"Background has {X_B.shape[1]} features but target has "
+                    f"{data.shape[1]}. Same embedding model required."
                 )
-            return data, X_B, None, "external"
-
-        bg_idx = self._select_background_indices(
-            data,
-            ratio=float(cfg.background_ratio),
-            strategy=strategy,
-            random_state=int(cfg.random_state),
-        )
-        if bg_idx.size < 2:
-            raise ValueError(
-                f"Auto-split background has {bg_idx.size} samples; need ≥ 2."
-            )
-        return data, data[bg_idx], bg_idx, strategy   
-
+            source = getattr(cfg, "background_source", "pool")
+            return data, X_B, None, source 
 
     def get_params(self) -> dict[str, Any]:
-        """Return parameters and post-fit diagnostics for logging."""
         cfg = self.config
         params = {
             "n_components": int(cfg.n_components),
             "random_state": int(cfg.random_state),
-            "background_ratio": float(cfg.background_ratio),
             "background_strategy": str(cfg.background_strategy),
             "regularization_mu": float(cfg.regularization_mu),
             "standard_scale": bool(cfg.standard_scale),
@@ -596,75 +581,14 @@ class PPCAReducer(DimensionReducer):
             params["background_source"] = self.background_source_
         if hasattr(self, "eigenvalues_"):
             params["eigenvalue_ratios"] = self.eigenvalues_.tolist()
-        if getattr(self, "background_indices_", None) is not None:
-            params["n_background_samples"] = int(self.background_indices_.size)
+        # The pipeline attaches background_details as a side-channel dict.
+        details = getattr(cfg, "background_details", None)
+        if details:
+            params["background_details"] = details
+        n_bg = getattr(cfg, "background_n_samples", None)
+        if n_bg is not None:
+            params["n_background_samples"] = int(n_bg)
         return params
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-
-    @staticmethod
-    def _select_background_indices(
-        data: np.ndarray,
-        *,
-        ratio: float,
-        strategy: str,
-        random_state: int,
-    ) -> np.ndarray:
-        """Select indices of an auto-split background subset.
-
-        Strategies:
-          random  : uniform sample without replacement.
-          uniform : k-means with k=n_background; pick the sample closest to
-                    each centroid.
-          outlier : score by mean distance to k=15 NN; pick the highest.
-        """
-        n_samples = data.shape[0]
-        n_background = max(2, int(round(ratio * n_samples)))
-        n_background = min(n_background, n_samples - 1)
-        rng = np.random.default_rng(random_state)
-
-        if strategy == "random":
-            return rng.choice(n_samples, size=n_background, replace=False)
-
-        if strategy == "uniform":
-            from sklearn.cluster import KMeans
-            from scipy.spatial.distance import cdist
-
-            km = KMeans(
-                n_clusters=n_background,
-                n_init=4,
-                random_state=random_state,
-            ).fit(data)
-            dists = cdist(km.cluster_centers_, data)
-            closest = np.argmin(dists, axis=1)
-            unique = np.unique(closest)
-            if unique.size < n_background:
-                remaining = np.setdiff1d(np.arange(n_samples), unique)
-                extra = rng.choice(
-                    remaining,
-                    size=n_background - unique.size,
-                    replace=False,
-                )
-                unique = np.concatenate([unique, extra])
-            return unique[:n_background]
-
-        if strategy == "outlier":
-            from sklearn.neighbors import NearestNeighbors
-
-            k = min(15, n_samples - 1)
-            nn = NearestNeighbors(n_neighbors=k + 1).fit(data)
-            distances, _ = nn.kneighbors(data)
-            outlier_score = distances[:, 1:].mean(axis=1)
-            order = np.argsort(outlier_score)[::-1]
-            return order[:n_background]
-
-        raise ValueError(
-            f"Unknown background_strategy={strategy!r}. "
-            f"Expected one of: external, random, uniform, outlier."
-        )
     
 
 # =============================================================================
@@ -774,7 +698,6 @@ class KPPCAReducer(PPCAReducer):
 
         self.eigenvalues_ = top_eigvals
         self.eigenvectors_ = top_eigvecs
-        self.background_indices_ = bg_idx
         self.background_source_ = bg_source
         self.kernel_source_ = kernel_meta["source"]
         self.kernel_ = kernel_meta["kernel"]

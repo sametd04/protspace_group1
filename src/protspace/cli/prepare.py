@@ -18,12 +18,9 @@ import typer
 
 from protspace.cli.app import app, setup_logging
 from protspace.cli.common_options import (
-    BackgroundStrategy,
     Kernel,
     KernelSource,
     Metric,
-    Opt_BackgroundRatio,
-    Opt_BackgroundStrategy,
     Opt_BatchSize,
     Opt_Eps,
     Opt_Fasta,
@@ -48,6 +45,13 @@ from protspace.cli.common_options import (
     Opt_Similarity,
     Opt_StandardScale,
     Opt_Verbose,
+    PpcaStrategy,
+    Opt_PpcaStrategy,
+    Opt_PpcaTargetAnnotation,
+    Opt_PpcaTargetValues,
+    Opt_PpcaStratifyBy,
+    Opt_PpcaMatchLength,
+    Opt_PpcaSamplesPerTarget,
 )
 
 logger = logging.getLogger(__name__)
@@ -248,6 +252,12 @@ def _embed_all(
     return cached_names
 
 
+def _parse_csv(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return tuple(v.strip() for v in value.split(",") if v.strip())
+
+
 @app.command()
 def prepare(
     input: Opt_Input = None,
@@ -269,8 +279,12 @@ def prepare(
     max_iter: Opt_MaxIter = 300,
     eps: Opt_Eps = 1e-3,
     regularization_mu: Opt_RegularizationMu = 1e-3,
-    background_ratio: Opt_BackgroundRatio = 0.3,
-    background_strategy: Opt_BackgroundStrategy = BackgroundStrategy.outlier,
+    ppca_strategy: Opt_PpcaStrategy = PpcaStrategy.pool,
+    ppca_target_annotation: Opt_PpcaTargetAnnotation = None,
+    ppca_target_values: Opt_PpcaTargetValues = None,
+    ppca_stratify_by: Opt_PpcaStratifyBy = None,
+    ppca_match_length: Opt_PpcaMatchLength = False,
+    ppca_samples_per_target: Opt_PpcaSamplesPerTarget = 3,
     ppca_background: Opt_PpcaBackground = None,
     standard_scale: Opt_StandardScale = True,
     kppca_kernel: Opt_KppcaKernel = Kernel.gaussian,
@@ -480,10 +494,14 @@ def prepare(
             max_iter=max_iter,
             eps=eps,
             regularization_mu=regularization_mu,
-            background_ratio=background_ratio,
-            background_strategy=background_strategy.value,
+            background_strategy=ppca_strategy.value,
             standard_scale=standard_scale,
             background_path=str(ppca_background) if ppca_background else "",
+            target_annotation=ppca_target_annotation or "",
+            target_values=_parse_csv(ppca_target_values),
+            stratify_by=_parse_csv(ppca_stratify_by),
+            match_length=ppca_match_length,
+            samples_per_target=ppca_samples_per_target,
             kernel=kppca_kernel.value,
             kernel_source=kppca_kernel_source.value,
             kernel_bandwidth=kppca_kernel_bandwidth,

@@ -43,9 +43,10 @@ class BaseProcessor:
             "eps",
             "random_state",
             "regularization_mu",
-            "background_ratio",
             "background_strategy",
             "standard_scale",
+            "samples_per_target",
+            "n_length_bins",
             "kernel", 
             "kernel_source", 
             "kernel_bandwidth", 
@@ -56,10 +57,13 @@ class BaseProcessor:
         }
         config = DimensionReductionConfig(n_components=dims, **filtered_config)
 
-        # Side channels for non-primitive data types (arrays/matrices).
+        # Side channels for dynamic metadata and non-primitive data types.
         # DimensionReductionConfig is frozen, so we attach via object.__setattr__.
         for side_key in (
             "background_data", 
+            "background_source",
+            "background_n_samples",
+            "background_details",
             "kernel_precomputed_matrix",
             "kernel_similarity_matrix"
         ):

@@ -127,8 +127,7 @@ def test_ppca_matches_reference(synthetic_data):
     cfg = DimensionReductionConfig(
         n_components=2,
         regularization_mu=1e-3,
-        background_ratio=0.3,
-        background_strategy="external",
+        background_strategy="pool",
         standard_scale=True,
     )
     # Side channel — same mechanism the pipeline uses.
@@ -146,13 +145,13 @@ def test_kppca_linear_kernel_equals_ppca(synthetic_data):
     """linear kernel ⇒ K=I ⇒ k-ρPCA reduces exactly to ρPCA."""
     X_T, X_B = synthetic_data
     cfg_ppca = DimensionReductionConfig(
-        n_components=2, background_strategy="external", standard_scale=True,
+        n_components=2, background_strategy="pool", standard_scale=True,
     )
     object.__setattr__(cfg_ppca, "background_data", X_B)
     proj_ppca = PPCAReducer(cfg_ppca).fit_transform(X_T)
 
     cfg_kppca = DimensionReductionConfig(
-        n_components=2, background_strategy="external", standard_scale=True,
+        n_components=2, background_strategy="pool", standard_scale=True,
         kernel="linear", kernel_source="embedding",
     )
     object.__setattr__(cfg_kppca, "background_data", X_B)
@@ -176,7 +175,7 @@ def test_kppca_gaussian_matches_reference(synthetic_data):
     K = squareform(weights, checks=False); np.fill_diagonal(K, 1.0)
 
     cfg = DimensionReductionConfig(
-        n_components=2, background_strategy="external", standard_scale=True,
+        n_components=2, background_strategy="pool", standard_scale=True,
         kernel="gaussian", kernel_source="embedding",
         kernel_bandwidth=bandwidth,  # pin to skip auto-resolution
     )
@@ -206,7 +205,7 @@ def test_kppca_precomputed_kernel(synthetic_data):
     np.fill_diagonal(K, 1.0)
 
     cfg = DimensionReductionConfig(
-        n_components=2, background_strategy="external", standard_scale=True,
+        n_components=2, background_strategy="pool", standard_scale=True,
         kernel_source="precomputed",
     )
     object.__setattr__(cfg, "background_data", X_B)

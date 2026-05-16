@@ -45,19 +45,24 @@ class ReducerParams:
 
     # ρPCA
     regularization_mu: float = 1e-3
-    background_ratio: float = 0.3
-    background_strategy: str = "outlier"
+    background_strategy: str = "pool"
     standard_scale: bool = True
-    # Path to external background HDF5. When set, takes precedence over
-    # background_strategy and forces strategy="external" in the reducer.
     background_path: str = ""
+
+    # Strategy-specific parameters (only some apply to each strategy)
+    target_annotation: str = ""           # complement: column name
+    target_values: tuple[str, ...] = ()   # complement: target value list
+    stratify_by: tuple[str, ...] = ()     # stratified, mixed: column names
+    match_length: bool = False            # mixed: include length axis
+    samples_per_target: int = 3           # length_matched, stratified, mixed
+    n_length_bins: int = 10               # length_matched, mixed
 
     # k-ρPCA
     kernel: str = "gaussian"
     kernel_source: str = "embedding"
     kernel_bandwidth: float = 0.0
     background_kernel: bool = False
-    kernel_path: str = ""  # for kernel_source="precomputed"
+    kernel_path: str = ""  
 
 
 @dataclass(frozen=True)
@@ -193,24 +198,36 @@ def _run_with_overridden_config(
         base.config = saved
 
 
-def _load_background_h5(path: Path) -> np.ndarray:
-    """Load all embedding vectors from an HDF5 file as a (n, d) ndarray.
-
-    Identifier ordering is not preserved — only the vector matrix is needed
-    for ρPCA's covariance computation.
-    """
+def _load_background_h5(path: Path) -> tuple[np.ndarray, list[str]]:
     from protspace.data.loaders import load_h5
 
     emb_set = load_h5([path])
     arr = np.asarray(emb_set.data, dtype=np.float64)
-    logger.info(
-        "Loaded ρPCA background: %d samples × %d features from %s",
-        arr.shape[0],
-        arr.shape[1],
-        path,
-    )
-    return arr
+    headers = list(emb_set.headers)
+    logger.info("Loaded ρPCA pool: %d × %d from %s", *arr.shape, path)
+    return arr, headers
 
+def _lengths_from_fasta(path: Path, headers: list[str]) -> np.ndarray:
+    """Return a length array aligned with headers."""
+    from protspace.data.io.fasta import parse_fasta
+    from protspace.data.loaders.h5 import parse_identifier
+
+    raw = parse_fasta(Path(path))
+    by_id = {parse_identifier(h): len(s) for h, s in raw.items()}
+    return np.array([by_id.get(h, 0) for h in headers], dtype=int)
+
+def _lengths_from_annotations(
+    annot: pd.DataFrame, headers: list[str], column: str = "sequence_length",
+) -> np.ndarray | None:
+    if column not in annot.columns:
+        return None
+    by_id = dict(zip(annot["identifier"], annot[column]))
+    try:
+        return np.array(
+            [int(by_id.get(h, 0)) for h in headers], dtype=int,
+        )
+    except (TypeError, ValueError):
+        return None
 
 def _load_kernel_matrix(path: Path) -> np.ndarray:
     """Load an n × n kernel/similarity matrix from .npy, .h5, or .parquet.
@@ -263,6 +280,10 @@ class ReductionPipeline:
         self._background_cache: np.ndarray | None = None
         # Same for external similarity matrix for k-ρPCA.
         self._similarity_matrix_cache: np.ndarray | None = None
+        self._background_pool_headers: list[str] = []
+        self._background_pool_annotations: pd.DataFrame = pd.DataFrame()
+        self._background_pool_lengths: np.ndarray | None = None
+        self._sequence_lengths: dict[str, np.ndarray] = {}
 
     def run(self, embedding_sets: list[EmbeddingSet]) -> Path:
         if not embedding_sets:
@@ -292,7 +313,16 @@ class ReductionPipeline:
             )
         metadata = full_metadata
 
-        all_reductions = self._run_reductions(embedding_sets)
+        for emb_set in embedding_sets:
+            lengths = None
+            if emb_set.fasta_path and Path(emb_set.fasta_path).exists():
+                lengths = _lengths_from_fasta(emb_set.fasta_path, emb_set.headers)
+            if lengths is None:
+                lengths = _lengths_from_annotations(metadata, emb_set.headers)
+            if lengths is not None:
+                self._sequence_lengths[emb_set.name] = lengths
+
+        all_reductions = self._run_reductions(embedding_sets, metadata)
 
         output = self.base.create_output(metadata, all_reductions, all_headers)
         self.base.save_output(
@@ -614,78 +644,139 @@ class ReductionPipeline:
         )
 
     # --- ρPCA background loading ---
-
     def _get_background_data(self) -> np.ndarray | None:
-        """Load the external ρPCA background (cached after first call)."""
-        path_str = self.config.reducer_params.background_path
-        if not path_str:
-            return None
-        if self._background_cache is None:
-            self._background_cache = _load_background_h5(Path(path_str))
-        return self._background_cache
-
-    def _prepare_ppca_params(
-        self, effective_params: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Resolve ρPCA-specific knobs in the effective params.
-
-        If background_path is set (either globally or as a per-method
-        override), force strategy="external" and load the background.
-        Otherwise leave the auto-split strategy in place and emit a warning
-        on first use.
-        """
-        params = dict(effective_params)
-        path_str = params.get("background_path", "") or ""
-        if path_str:
-            params["background_strategy"] = "external"
-            params["background_data"] = self._get_background_data()
-        elif params.get("background_strategy") not in (
-            "random",
-            "uniform",
-            "outlier",
-        ):
-            # Should not happen via the CLI, but guard the case where a
-            # user manually passes background_strategy=external without a
-            # background_path.
-            params["background_strategy"] = "outlier"
-
-        # background_path is a path string, not a reducer param; drop it.
-        params.pop("background_path", None)
-        return params
-
-
-    def _prepare_kppca_params(self, effective_params: dict) -> dict:
-        """Resolve k-ρPCA kernel inputs in effective params.
-
-        Inherits all PPCA preparation (external background, etc.), then attaches
-        either a precomputed kernel matrix or — for kernel_source='similarity' —
-        a sequence-similarity matrix from the run.
-        """
-        params = self._prepare_ppca_params(effective_params)  # handle background first
-
-        source = params.get("kernel_source", "embedding")
-        if source == "precomputed":
-            path_str = params.get("kernel_path", "") or ""
+            """Load the external ρPCA background (cached after first call)."""
+            path_str = self.config.reducer_params.background_path
             if not path_str:
+                return None
+            if self._background_cache is None:
+                arr, headers = _load_background_h5(Path(path_str))
+                self._background_cache = arr
+                self._background_pool_headers = headers
+
+                pool_annot = self._fetch_annotations(headers)
+                self._background_pool_annotations = pool_annot
+                self._background_pool_lengths = _lengths_from_annotations(pool_annot, headers)
+            return self._background_cache
+
+
+    def _build_ppca_background(
+        self,
+        target_embeddings: np.ndarray,
+        target_headers: list[str],
+        target_annotations: pd.DataFrame,
+        target_lengths: np.ndarray | None,
+        rng: np.random.Generator,
+    ):
+        """Construct the ρPCA background via the configured strategy.
+
+        Returns a BackgroundSpec from background_strategies.build_background.
+        Loads the pool (external HDF5 if --ppca-background, else input itself)
+        and threads the appropriate strategy-specific arguments through.
+        """
+        from protspace.data.processors.background_strategies import (
+            build_background, POOL, COMPLEMENT, LENGTH_MATCHED, STRATIFIED, MIXED,
+        )
+
+        rp = self.config.reducer_params
+        strategy = rp.background_strategy
+
+        # Resolve the pool. complement uses input-as-pool; everything else
+        # uses the external HDF5 if provided, otherwise raises.
+        if strategy == COMPLEMENT:
+            pool_emb = target_embeddings
+            pool_headers = target_headers
+            pool_annot = target_annotations
+            pool_lengths = target_lengths
+        else:
+            if not rp.background_path:
                 raise ValueError(
-                    "kppca with kernel_source='precomputed' requires --kppca-kernel-path."
+                    f"ρPCA strategy {strategy!r} requires an external pool. "
+                    "Pass --ppca-background <pool.h5>."
                 )
-            params["kernel_precomputed_matrix"] = _load_kernel_matrix(Path(path_str))
-        elif source == "similarity":
-            sim = self._similarity_matrix_cache
-            if sim is None:
+            pool_emb = self._get_background_data()  # cached external loader
+            pool_headers = self._background_pool_headers
+            pool_annot = self._background_pool_annotations
+            pool_lengths = self._background_pool_lengths
+
+        kwargs = dict(
+            pool_embeddings=pool_emb,
+            pool_headers=pool_headers,
+            pool_annotations=pool_annot,
+            target_embeddings=target_embeddings,
+            target_headers=target_headers,
+            target_annotations=target_annotations,
+            rng=rng,
+            samples_per_target=rp.samples_per_target,
+            n_length_bins=rp.n_length_bins,
+        )
+
+        if strategy == COMPLEMENT:
+            if not rp.target_annotation or not rp.target_values:
                 raise ValueError(
-                    "kppca with kernel_source='similarity' requires --similarity "
-                    "(MMseqs2). Pass -s/--similarity and -f FASTA at the CLI."
+                    "Strategy 'complement' requires --ppca-target-annotation "
+                    "and --ppca-target-values."
                 )
-            params["kernel_similarity_matrix"] = sim
-        params.pop("kernel_path", None)
-        return params
+            kwargs["target_annotation"] = rp.target_annotation
+            kwargs["target_values"] = list(rp.target_values)
+
+        elif strategy == LENGTH_MATCHED:
+            if target_lengths is None or pool_lengths is None:
+                raise ValueError(
+                    "Strategy 'length_matched' needs sequence lengths. "
+                    "Pass -f FASTA or include 'sequence_length' in annotations."
+                )
+            kwargs["pool_lengths"] = pool_lengths
+            kwargs["target_lengths"] = target_lengths
+
+        elif strategy == STRATIFIED:
+            if not rp.stratify_by:
+                raise ValueError(
+                    "Strategy 'stratified' requires --ppca-stratify-by."
+                )
+            kwargs["stratify_by"] = list(rp.stratify_by)
+
+        elif strategy == MIXED:
+            if not rp.stratify_by and not rp.match_length:
+                raise ValueError(
+                    "Strategy 'mixed' requires at least one of "
+                    "--ppca-stratify-by or --ppca-match-length."
+                )
+            kwargs["stratify_by"] = list(rp.stratify_by)
+            kwargs["match_length"] = rp.match_length
+            if rp.match_length:
+                kwargs["pool_lengths"] = pool_lengths
+                kwargs["target_lengths"] = target_lengths
+
+        return build_background(strategy, **kwargs)    
+        
+
+    def _resolve_kppca_kernel(self, effective_params: dict) -> dict:
+            params = dict(effective_params)
+
+            source = params.get("kernel_source", "embedding")
+            if source == "precomputed":
+                path_str = params.get("kernel_path", "") or ""
+                if not path_str:
+                    raise ValueError(
+                        "kppca with kernel_source='precomputed' requires --kppca-kernel-path."
+                    )
+                params["kernel_precomputed_matrix"] = _load_kernel_matrix(Path(path_str))
+            elif source == "similarity":
+                sim = self._similarity_matrix_cache
+                if sim is None:
+                    raise ValueError(
+                        "kppca with kernel_source='similarity' requires --similarity "
+                        "(MMseqs2). Pass -s/--similarity and -f FASTA at the CLI."
+                    )
+                params["kernel_similarity_matrix"] = sim
+            params.pop("kernel_path", None)
+            return params
 
     # --- Dimensionality reduction ---
 
     def _run_reductions(
-        self, embedding_sets: list[EmbeddingSet]
+        self, embedding_sets: list[EmbeddingSet], annotations_df: pd.DataFrame
     ) -> list[dict[str, Any]]:
         all_reductions = []
         cached_projections: list[str] = []
@@ -731,30 +822,26 @@ class ReductionPipeline:
 
                 effective_params = {**global_params, **spec.overrides_dict}
 
-                # ρPCA-specific resolution.
-                if method == PPCA_NAME:
-                    effective_params = self._prepare_ppca_params(effective_params)
-                    has_external = effective_params.get("background_data") is not None
-                    if not has_external and not ppca_warned:
-                        logger.warning(
-                            "ρPCA: no external background provided via "
-                            "--ppca-background; falling back to auto-split "
-                            "strategy '%s' (background_ratio=%.2f). Results "
-                            "are usually inferior to a true contrastive "
-                            "background. Provide a biologically meaningful "
-                            "background dataset for best results.",
-                            effective_params.get("background_strategy"),
-                            effective_params.get("background_ratio", 0.0),
-                        )
-                        ppca_warned = True
-                elif method == KPPCA_NAME:
-                    effective_params = self._prepare_kppca_params(effective_params)
-                    if effective_params.get("background_data") is None and not ppca_warned:
-                        logger.warning(
-                            "k-ρPCA: no external background; falling back to auto-split '%s'.",
-                            effective_params.get("background_strategy"),
-                        )
-                        ppca_warned = True
+                emb_data_for_run = emb_set.data
+
+                if method == PPCA_NAME or method == KPPCA_NAME:
+                    spec_bg = self._build_ppca_background(
+                        target_embeddings=emb_set.data,
+                        target_headers=emb_set.headers,
+                        target_annotations=annotations_df,
+                        target_lengths=self._sequence_lengths.get(emb_set.name),
+                        rng=np.random.default_rng(effective_params["random_state"]),
+                    )
+                    effective_params["background_data"] = spec_bg.X_background
+                    effective_params["background_source"] = spec_bg.source
+                    effective_params["background_n_samples"] = spec_bg.n_background
+                    effective_params["background_details"] = spec_bg.details
+                    
+                    if spec_bg.X_target is not None:
+                        emb_data_for_run = spec_bg.X_target
+                        
+                    if method == KPPCA_NAME:
+                        effective_params = self._resolve_kppca_kernel(effective_params)          
 
                 param_suffix = disambiguation_suffix(spec, method_counts)
 
@@ -770,7 +857,7 @@ class ReductionPipeline:
 
                 logger.info(f"Applying {method.upper()} {dims} to '{emb_set.name}'")
                 reduction = _run_with_overridden_config(
-                    self.base, effective_params, method, dims, emb_set.data
+                    self.base, effective_params, method, dims, emb_data_for_run
                 )
 
                 reduction["name"] = format_projection_name(

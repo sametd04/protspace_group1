@@ -13,15 +13,6 @@ class Metric(str, Enum):
     manhattan = "manhattan"
 
 
-class BackgroundStrategy(str, Enum):
-    """Sampling policy for the ρPCA background set."""
-
-    external = "external"
-    random = "random"
-    uniform = "uniform"
-    outlier = "outlier"
-
-
 class Kernel(str, Enum):
     gaussian = "gaussian"
     inverse_distance = "inverse_distance"
@@ -32,6 +23,13 @@ class KernelSource(str, Enum):
     embedding = "embedding"
     similarity = "similarity"
     precomputed = "precomputed"
+
+class PpcaStrategy(str, Enum):
+    pool = "pool"
+    complement = "complement"
+    length_matched = "length_matched"
+    stratified = "stratified"
+    mixed = "mixed"
 
 
 # ---------------------------------------------------------------------------
@@ -141,33 +139,6 @@ Opt_RegularizationMu = Annotated[
         min=0.0,
     ),
 ]
-Opt_BackgroundRatio = Annotated[
-    float,
-    typer.Option(
-        "--background-ratio",
-        help=(
-            "ρPCA fraction of input samples used as background in "
-            "auto-split modes. Ignored when --ppca-background is set. "
-            "Must lie strictly in (0, 1)."
-        ),
-        rich_help_panel="Projection",
-        min=0.0,
-        max=1.0,
-    ),
-]
-Opt_BackgroundStrategy = Annotated[
-    BackgroundStrategy,
-    typer.Option(
-        "--background-strategy",
-        help=(
-            "ρPCA background construction policy. 'external' uses the "
-            "dataset from --ppca-background; 'random', 'uniform', and "
-            "'outlier' partition the target. If --ppca-background is "
-            "set, this flag is overridden to 'external'."
-        ),
-        rich_help_panel="Projection",
-    ),
-]
 Opt_PpcaBackground = Annotated[
     Path | None,
     typer.Option(
@@ -253,6 +224,79 @@ Opt_KppcaBackgroundKernel = Annotated[
             "Off by default — paper 2 keeps Σ_B unweighted."
         ),
         rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaStrategy = Annotated[
+    PpcaStrategy,
+    typer.Option(
+        "--ppca-strategy",
+        help=(
+            "ρPCA background construction strategy. "
+            "'pool' (default) uses the entire --ppca-background file. "
+            "'complement' splits the input by annotation. "
+            "'length_matched' draws a length-matched control from the pool. "
+            "'stratified' draws a control stratified by --ppca-stratify-by. "
+            "'mixed' combines stratification with length matching."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaTargetAnnotation = Annotated[
+    str | None,
+    typer.Option(
+        "--ppca-target-annotation",
+        help=(
+            "For --ppca-strategy=complement: annotation column that "
+            "identifies target rows in the input."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaTargetValues = Annotated[
+    str | None,
+    typer.Option(
+        "--ppca-target-values",
+        help=(
+            "For --ppca-strategy=complement: comma-separated values in "
+            "--ppca-target-annotation that mark target rows."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaStratifyBy = Annotated[
+    str | None,
+    typer.Option(
+        "--ppca-stratify-by",
+        help=(
+            "For --ppca-strategy=stratified or mixed: comma-separated "
+            "annotation columns to stratify the background by. Common "
+            "choices: 'superkingdom', 'signal_peptide'."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaMatchLength = Annotated[
+    bool,
+    typer.Option(
+        "--ppca-match-length/--no-ppca-match-length",
+        help=(
+            "For --ppca-strategy=mixed: include sequence length as an "
+            "additional stratification axis."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaSamplesPerTarget = Annotated[
+    int,
+    typer.Option(
+        "--ppca-samples-per-target",
+        help=(
+            "For length_matched / stratified / mixed: number of pool "
+            "samples drawn per target sample. Larger values give a smoother "
+            "Σ_B estimate at the cost of larger background sets."
+        ),
+        rich_help_panel="Projection",
+        min=1,
     ),
 ]
 Opt_BatchSize = Annotated[
