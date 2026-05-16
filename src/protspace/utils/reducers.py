@@ -16,6 +16,7 @@ from protspace.utils.constants import (  # noqa: F401
     PACMAP_NAME,
     PCA_NAME,
     PPCA_NAME,
+    KPPCA_NAME,
     REDUCER_METHODS,
     TSNE_NAME,
     UMAP_NAME,
@@ -362,53 +363,100 @@ class MDSReducer(DimensionReducer):
         }
 
 
+
 # =============================================================================
-# ρPCA  (rhoPCA — Carilli, Jackson & Pachter 2025)
-#
-# Reference: Carilli, M., Jackson, K., & Pachter, L. (2025).
-#   "The Rayleigh Quotient and Contrastive Principal Component Analysis I."
-#   bioRxiv 2025.11.19.689125. https://github.com/pachterlab/rhopca
-#
-# Mathematical objective
-# ----------------------
-# Given target data X_T ∈ R^{n_T × d} and background data X_B ∈ R^{n_B × d},
-# ρPCA finds directions v that maximize the Rayleigh quotient
-#
-#     R(v) = (v^T Σ_T v) / (v^T Σ_B v)
-#
-# where Σ_T and Σ_B are the per-set sample covariance matrices computed on
-# separately standard-scaled data. The maximizers are the top eigenvectors
-# of the generalized eigenproblem
-#
-#     Σ_T v = λ Σ_B v
-#
-# solved via scipy.linalg.eigh(Σ_T, Σ_B). Per-set standard-scaling (mean 0,
-# unit variance) makes the covariance matrices correlation matrices and is
-# the convention used by the rhopca reference implementation; it is
-# essential for PLM embeddings whose dimensions have wildly heterogeneous
-# scale.
-#
-# Background sources
-# ------------------
-# Two modes:
-#
-#   1. External (preferred, matches paper): user supplies a separate
-#      background dataset via --ppca-background. The reducer receives it
-#      through cfg.background_data and uses it directly.
-#
-#   2. Auto-split (no external background): partition the input data into
-#      target = full input and background = subset chosen by strategy:
-#      "random", "uniform", or "outlier". This is a heuristic; results
-#      are usually inferior to a real background. The pipeline emits a
-#      warning when no external background is provided.
-#
-# Regularization
-# --------------
-# Σ_B is singular whenever n_background ≤ d. For PLM embeddings (d ≥ 1024)
-# this is the default regime. regularization_mu adds μI to Σ_B before
-# solving. The default is 1e-3 — safe for typical PLM embeddings after
-# standard-scaling.
+# Shared eigenproblem solver for both ρPCA and k-ρPCA.
 # =============================================================================
+
+def _solve_rho_eigenproblem(
+    sigma_target: np.ndarray,
+    sigma_background: np.ndarray,
+    n_components: int,
+    regularization_mu: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Solve Σ_T v = λ Σ_B v and return the top `n_components` eigenpairs.
+
+    Adds μI to Σ_B for Tikhonov regularization, solves with scipy.linalg.eigh,
+    then keeps eigenpairs with positive finite eigenvalues (rhopca reference
+    convention; see rhopca/utils/misc.py::generalized_eigen). The returned
+    eigenvectors are sign-normalized so that, for each axis, the entry of
+    largest magnitude is positive.
+
+    Parameters
+    ----------
+    sigma_target : (d, d) float64
+    sigma_background : (d, d) float64
+    n_components : int
+    regularization_mu : float, ≥ 0
+
+    Returns
+    -------
+    eigvals : (k,) float64, descending. k ≤ n_components — fewer if some
+        eigenvalues are filtered out as non-positive.
+    eigvecs : (d, k) float64
+    """
+    from scipy.linalg import LinAlgError, eigh
+
+    d = sigma_background.shape[0]
+    if regularization_mu > 0.0:
+        sigma_background = sigma_background + regularization_mu * np.eye(d, dtype=np.float64)
+
+    try:
+        eigenvalues, eigenvectors = eigh(sigma_target, sigma_background)
+    except LinAlgError as err:
+        raise LinAlgError(
+            "ρPCA generalized eigenproblem failed: Σ_B is not positive "
+            "definite even after Tikhonov regularization. Increase "
+            f"regularization_mu (currently {regularization_mu}). "
+            f"Original error: {err}"
+        ) from err
+
+    # Filter to positive finite eigenvalues (rhopca convention) and sort desc.
+    valid = (eigenvalues > 0) & np.isfinite(eigenvalues)
+    eigenvalues = eigenvalues[valid]
+    eigenvectors = eigenvectors[:, valid]
+    order = np.argsort(eigenvalues)[::-1]
+    eigenvalues = eigenvalues[order]
+    eigenvectors = eigenvectors[:, order]
+
+    if eigenvalues.size < n_components:
+        logger.warning(
+            "ρPCA: only %d positive eigenvalues available, requested %d. "
+            "Returning %d components.",
+            eigenvalues.size, n_components, eigenvalues.size,
+        )
+
+    top_eigvals = eigenvalues[:n_components]
+    top_eigvecs = eigenvectors[:, :n_components]
+
+    # Sign normalization for deterministic output.
+    for k in range(top_eigvecs.shape[1]):
+        j = int(np.argmax(np.abs(top_eigvecs[:, k])))
+        if top_eigvecs[j, k] < 0:
+            top_eigvecs[:, k] = -top_eigvecs[:, k]
+
+    return top_eigvals, top_eigvecs
+
+
+
+def _standard_scale_columns(X: np.ndarray) -> np.ndarray:
+    """Per-set standardization: column mean 0, column variance 1. Constant
+    columns are left at zero to avoid amplifying noise."""
+    mean = X.mean(axis=0, keepdims=True)
+    centered = X - mean
+    std = centered.std(axis=0, keepdims=True, ddof=1)
+    std_safe = np.where(std < 1e-12, 1.0, std)
+    return centered / std_safe
+
+
+def _sample_covariance(centered: np.ndarray) -> np.ndarray:
+    """Bessel-corrected sample covariance of an already-centered matrix."""
+    n = centered.shape[0]
+    if n < 2:
+        raise ValueError(f"Need at least 2 samples to compute covariance, got {n}.")
+    cov = (centered.T @ centered) / (n - 1)
+    return 0.5 * (cov + cov.T)
+
 
 
 class PPCAReducer(DimensionReducer):
@@ -427,137 +475,111 @@ class PPCAReducer(DimensionReducer):
         eigenvectors_ : (d, n_components) generalized eigenvectors.
         background_indices_ : indices into the input array (auto-split only).
         background_source_ : "external" or one of the auto-split strategies.
+
+    Solves Σ_T v = λ Σ_B v for the top n_components eigenvectors. See
+    Carilli, Jackson & Pachter 2025 (bioRxiv 2025.11.19.689125) for the
+    objective; matches the rhopca reference implementation
+    (https://github.com/pachterlab/rhopca) with the following choices:
+
+      * Per-set standard-scaling (paper convention, scale_variance=True)
+      * Bessel-corrected covariance (bias=False)
+      * Fixed Tikhonov μ (default 1e-3); rhopca defaults to a trace-scaled
+        heuristic μ = 1e-6 · tr(Σ_B) / d, which can be too small for PLM
+        embeddings where n_B < d. The fixed default is safer in that regime.
+      * Eigenvalues filtered to positive finite values before truncation.
     """
 
     def fit_transform(self, data: np.ndarray) -> np.ndarray:
-        from scipy.linalg import LinAlgError, eigh
-
         cfg = self.config
-        n_components = int(cfg.n_components)
-        random_state = int(cfg.random_state)
-        background_ratio = float(cfg.background_ratio)
-        background_strategy = str(cfg.background_strategy)
-        regularization_mu = float(cfg.regularization_mu)
-        standard_scale = bool(cfg.standard_scale)
-
-        # External background data is stashed on the config by the pipeline
-        # under the attribute name `background_data`. It's not a dataclass
-        # field because it can be a (potentially large) ndarray; we attach
-        # it dynamically before the reducer is constructed.
-        background_data = getattr(cfg, "background_data", None)
 
         data = np.asarray(data, dtype=np.float64)
         if data.ndim != 2:
             raise ValueError(f"PPCA expects 2D input, got shape {data.shape}.")
         n_samples, n_features = data.shape
 
-        if n_components > n_features:
+        if int(cfg.n_components) > n_features:
             raise ValueError(
-                f"n_components={n_components} > n_features={n_features}."
+                f"n_components={cfg.n_components} > n_features={n_features}."
             )
 
-        # --- Resolve target and background matrices ---
-        if background_strategy == "external":
-            if background_data is None:
-                raise ValueError(
-                    "background_strategy='external' requires a background "
-                    "dataset, but config.background_data is None. Pass "
-                    "--ppca-background <file.h5> on the CLI, or choose a "
-                    "different background_strategy."
-                )
-            X_target = data
-            X_background = np.asarray(background_data, dtype=np.float64)
-            if X_background.ndim != 2:
-                raise ValueError(
-                    f"External background must be 2D, got shape "
-                    f"{X_background.shape}."
-                )
-            if X_background.shape[1] != n_features:
-                raise ValueError(
-                    f"External background has {X_background.shape[1]} features "
-                    f"but target has {n_features}. Both datasets must use the "
-                    f"same embedding model (same dimensionality)."
-                )
-            self.background_indices_ = None
-            self.background_source_ = "external"
-        else:
-            bg_idx = self._select_background_indices(
-                data,
-                ratio=background_ratio,
-                strategy=background_strategy,
-                random_state=random_state,
-            )
-            self.background_indices_ = bg_idx
-            self.background_source_ = background_strategy
-            if bg_idx.size < 2:
-                raise ValueError(
-                    f"Background set has {bg_idx.size} samples; need >= 2 "
-                    f"for a non-degenerate covariance. Increase "
-                    f"background_ratio or input size."
-                )
-            X_target = data
-            X_background = data[bg_idx]
+        X_target, X_background, bg_idx, bg_source = self._resolve_target_background(
+            data, cfg
+        )
 
-        if X_background.shape[0] < 2:
-            raise ValueError(
-                f"Background has {X_background.shape[0]} samples; need >= 2."
-            )
-
-        # --- Per-set standardization (matches Carilli/Jackson/Pachter convention) ---
-        # Standard-scaling makes covariances into correlation matrices and
-        # neutralizes per-dimension scale differences between target and
-        # background. Essential for PLM embeddings.
-        if standard_scale:
-            X_target_p = self._standard_scale(X_target)
-            X_background_p = self._standard_scale(X_background)
+        # Per-set standardization (paper convention).
+        if cfg.standard_scale:
+            X_target_p = _standard_scale_columns(X_target)
+            X_background_p = _standard_scale_columns(X_background)
         else:
             X_target_p = X_target - X_target.mean(axis=0, keepdims=True)
             X_background_p = X_background - X_background.mean(axis=0, keepdims=True)
 
-        # --- Sample covariance matrices ---
-        sigma_target = self._compute_covariance(X_target_p)
-        sigma_background = self._compute_covariance(X_background_p)
+        sigma_target = _sample_covariance(X_target_p)
+        sigma_background = _sample_covariance(X_background_p)
 
-        # --- Tikhonov regularization ---
-        if regularization_mu > 0.0:
-            sigma_background = sigma_background + regularization_mu * np.eye(
-                n_features, dtype=np.float64
-            )
-
-        # --- Solve generalized eigenproblem  Σ_T v = λ Σ_B v ---
         try:
-            eigenvalues, eigenvectors = eigh(sigma_target, sigma_background)
-        except (LinAlgError, ValueError) as err:
+            top_eigvals, top_eigvecs = _solve_rho_eigenproblem(
+                sigma_target, sigma_background,
+                n_components=int(cfg.n_components),
+                regularization_mu=float(cfg.regularization_mu),
+            )
+        except np.linalg.LinAlgError as err:
             deficiency = max(0, n_features - X_background.shape[0] + 1)
-            raise LinAlgError(
-                f"ρPCA generalized eigenproblem failed: Σ_B is not positive "
-                f"definite. With n_background={X_background.shape[0]} and "
-                f"n_features={n_features}, Σ_B is rank-deficient by at "
-                f"least {deficiency} dimensions. Set regularization_mu to "
-                f"a small positive value (e.g. 1e-3) to stabilize. "
-                f"Original error: {err}"
+            raise type(err)(
+                f"{err}\n  n_background={X_background.shape[0]}, "
+                f"n_features={n_features}, deficiency ≥ {deficiency}. "
+                f"Try a larger regularization_mu or more background samples."
             ) from err
 
-        # eigh returns eigenvalues in ascending order; we want descending.
-        order = np.argsort(eigenvalues)[::-1]
-        eigenvalues = eigenvalues[order]
-        eigenvectors = eigenvectors[:, order]
+        self.eigenvalues_ = top_eigvals
+        self.eigenvectors_ = top_eigvecs
+        self.background_indices_ = bg_idx
+        self.background_source_ = bg_source
 
-        top_eigenvalues = eigenvalues[:n_components]
-        top_eigenvectors = eigenvectors[:, :n_components]
+        # Project the standardized target onto top eigenvectors.
+        return (X_target_p @ top_eigvecs).astype(np.float64)
+    
 
-        # --- Sign normalization (deterministic output) ---
-        for k in range(n_components):
-            j = int(np.argmax(np.abs(top_eigenvectors[:, k])))
-            if top_eigenvectors[j, k] < 0:
-                top_eigenvectors[:, k] = -top_eigenvectors[:, k]
+    def _resolve_target_background(
+        self, data: np.ndarray, cfg
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, str]:
+        """Decide target and background matrices based on the background strategy.
 
-        self.eigenvalues_ = top_eigenvalues
-        self.eigenvectors_ = top_eigenvectors
+        Returns (X_T, X_B, bg_indices_or_None, source_label).
+        """
+        background_data = getattr(cfg, "background_data", None)
+        strategy = str(cfg.background_strategy)
+        n_features = data.shape[1]
 
-        # --- Project the standardized target onto top eigenvectors ---
-        projection = X_target_p @ top_eigenvectors
-        return projection.astype(np.float64)
+        if strategy == "external":
+            if background_data is None:
+                raise ValueError(
+                    "background_strategy='external' requires a background "
+                    "dataset via --ppca-background, but config.background_data "
+                    "is None."
+                )
+            X_B = np.asarray(background_data, dtype=np.float64)
+            if X_B.ndim != 2:
+                raise ValueError(f"External background must be 2D, got {X_B.shape}.")
+            if X_B.shape[1] != n_features:
+                raise ValueError(
+                    f"External background has {X_B.shape[1]} features but "
+                    f"target has {n_features}. Same embedding model required."
+                )
+            return data, X_B, None, "external"
+
+        bg_idx = self._select_background_indices(
+            data,
+            ratio=float(cfg.background_ratio),
+            strategy=strategy,
+            random_state=int(cfg.random_state),
+        )
+        if bg_idx.size < 2:
+            raise ValueError(
+                f"Auto-split background has {bg_idx.size} samples; need ≥ 2."
+            )
+        return data, data[bg_idx], bg_idx, strategy   
+
 
     def get_params(self) -> dict[str, Any]:
         """Return parameters and post-fit diagnostics for logging."""
@@ -574,10 +596,7 @@ class PPCAReducer(DimensionReducer):
             params["background_source"] = self.background_source_
         if hasattr(self, "eigenvalues_"):
             params["eigenvalue_ratios"] = self.eigenvalues_.tolist()
-        if (
-            hasattr(self, "background_indices_")
-            and self.background_indices_ is not None
-        ):
+        if getattr(self, "background_indices_", None) is not None:
             params["n_background_samples"] = int(self.background_indices_.size)
         return params
 
@@ -585,31 +604,6 @@ class PPCAReducer(DimensionReducer):
     # Helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _standard_scale(X: np.ndarray) -> np.ndarray:
-        """Per-set standardization: column mean 0, column variance 1.
-
-        Constant columns (variance < 1e-12) are left at zero rather than
-        amplifying numerical noise. This matches sklearn's StandardScaler
-        behaviour with with_std=False on those columns.
-        """
-        mean = X.mean(axis=0, keepdims=True)
-        centered = X - mean
-        std = centered.std(axis=0, keepdims=True, ddof=1)
-        # Avoid division by zero on constant features.
-        std_safe = np.where(std < 1e-12, 1.0, std)
-        return centered / std_safe
-
-    @staticmethod
-    def _compute_covariance(centered: np.ndarray) -> np.ndarray:
-        """Bessel-corrected sample covariance of an already-centered matrix."""
-        n = centered.shape[0]
-        if n < 2:
-            raise ValueError(
-                f"Need at least 2 samples to compute covariance, got {n}."
-            )
-        cov = (centered.T @ centered) / (n - 1)
-        return 0.5 * (cov + cov.T)
 
     @staticmethod
     def _select_background_indices(
@@ -630,7 +624,6 @@ class PPCAReducer(DimensionReducer):
         n_samples = data.shape[0]
         n_background = max(2, int(round(ratio * n_samples)))
         n_background = min(n_background, n_samples - 1)
-
         rng = np.random.default_rng(random_state)
 
         if strategy == "random":
@@ -672,3 +665,222 @@ class PPCAReducer(DimensionReducer):
             f"Unknown background_strategy={strategy!r}. "
             f"Expected one of: external, random, uniform, outlier."
         )
+    
+
+# =============================================================================
+# k-ρPCA  (kernel-weighted contrastive PCA — Jackson, Carilli & Pachter 2026)
+#
+# Reference: Jackson, K., Carilli, M., & Pachter, L. (2026).
+#   "The Rayleigh Quotient and Contrastive Principal Component Analysis II."
+#   bioRxiv 2026.04.08.717236. https://github.com/pachterlab/rhopca
+#
+# Objective
+# ---------
+# Given centered target X_T ∈ R^{n_T × d}, background X_B ∈ R^{n_B × d}, and
+# kernel matrix K ∈ R^{n_T × n_T} encoding sample-similarity weights between
+# target samples, k-ρPCA maximises
+#
+#     R(v) = v^T Σ_T^K v / v^T Σ_B v
+#
+# with
+#     Σ_T^K = (1 / (n_T - 1)) X_T^T K X_T   (kernel-weighted target covariance)
+#     Σ_B   = (1 / (n_B - 1)) X_B^T X_B     (standard background covariance)
+#
+# When K = I, k-ρPCA reduces exactly to ρPCA. In paper 2, K typically encodes
+# spatial proximity (Visium spot coordinates). For protein embeddings we
+# expose three kernel sources:
+#
+#   embedding   K_ij = κ(x_i, x_j) — pairwise kernel on standardised target
+#               embeddings. Up-weights neighbours in pLM space → emphasises
+#               local rather than global axes of variation.
+#   similarity  K_ij = κ(d(seq_i, seq_j)) — MMseqs2-derived sequence similarity.
+#               Up-weights homologues. Requires precomputed similarity matrix.
+#   precomputed K is loaded directly from disk.
+#
+# Kernel functions
+# ----------------
+#   gaussian          K_ij = exp(-d_ij^2 / (2 h^2)),  h = sqrt(median(d)) by default
+#   inverse_distance  K_ij = 1 / (d_ij + ε)
+#   linear            K = I (sanity check; reduces k-ρPCA to ρPCA)
+# =============================================================================
+
+
+class KPPCAReducer(PPCAReducer):
+    """k-ρPCA: kernel-weighted contrastive DR.
+
+    Inherits background resolution and the eigenproblem solver from
+    PPCAReducer; overrides only how Σ_T is computed.
+
+    Attributes after fit (in addition to PPCAReducer attrs):
+        kernel_source_       : "embedding" | "similarity" | "precomputed"
+        kernel_              : kernel function name
+        kernel_bandwidth_    : actual bandwidth used (may be auto-resolved)
+        kernel_n_samples_    : n_T (size of K)
+    """
+
+    def fit_transform(self, data: np.ndarray) -> np.ndarray:
+        cfg = self.config
+
+        data = np.asarray(data, dtype=np.float64)
+        if data.ndim != 2:
+            raise ValueError(f"KPPCA expects 2D input, got shape {data.shape}.")
+        n_samples, n_features = data.shape
+        if int(cfg.n_components) > n_features:
+            raise ValueError(
+                f"n_components={cfg.n_components} > n_features={n_features}."
+            )
+
+        X_target, X_background, bg_idx, bg_source = self._resolve_target_background(
+            data, cfg
+        )
+
+        # Standardize per-set (paper convention).
+        if cfg.standard_scale:
+            X_target_p = _standard_scale_columns(X_target)
+            X_background_p = _standard_scale_columns(X_background)
+        else:
+            X_target_p = X_target - X_target.mean(axis=0, keepdims=True)
+            X_background_p = X_background - X_background.mean(axis=0, keepdims=True)
+
+        # Build the n_T × n_T kernel matrix K.
+        K, kernel_meta = self._build_kernel_matrix(X_target_p, cfg)
+
+        # Σ_T^K = X_T^T K X_T / (n_T - 1); X_T already centered.
+        n_t = X_target_p.shape[0]
+        sigma_target = (X_target_p.T @ K @ X_target_p) / (n_t - 1)
+        sigma_target = 0.5 * (sigma_target + sigma_target.T)
+
+        # Σ_B is standard (kernel-weighted background is opt-in and uncommon).
+        if cfg.background_kernel:
+            logger.warning(
+                "background_kernel=True is unusual for k-ρPCA on protein "
+                "embeddings; the background is assumed to lack the structure "
+                "encoded by K. Using identity kernel for Σ_B."
+            )
+        sigma_background = _sample_covariance(X_background_p)
+
+        try:
+            top_eigvals, top_eigvecs = _solve_rho_eigenproblem(
+                sigma_target, sigma_background,
+                n_components=int(cfg.n_components),
+                regularization_mu=float(cfg.regularization_mu),
+            )
+        except np.linalg.LinAlgError as err:
+            deficiency = max(0, n_features - X_background.shape[0] + 1)
+            raise type(err)(
+                f"{err}\n  n_background={X_background.shape[0]}, "
+                f"n_features={n_features}, deficiency ≥ {deficiency}."
+            ) from err
+
+        self.eigenvalues_ = top_eigvals
+        self.eigenvectors_ = top_eigvecs
+        self.background_indices_ = bg_idx
+        self.background_source_ = bg_source
+        self.kernel_source_ = kernel_meta["source"]
+        self.kernel_ = kernel_meta["kernel"]
+        self.kernel_bandwidth_ = kernel_meta["bandwidth"]
+        self.kernel_n_samples_ = n_t
+
+        return (X_target_p @ top_eigvecs).astype(np.float64)
+
+
+    def _build_kernel_matrix(
+        self, X_target_std: np.ndarray, cfg
+    ) -> tuple[np.ndarray, dict]:
+        """Construct the n_T × n_T kernel matrix K.
+
+        Returns (K, metadata_dict). Metadata is recorded in get_params() for
+        diagnostics in run.log.
+        """
+        from scipy.spatial.distance import pdist, squareform
+
+        source = str(cfg.kernel_source)
+        kernel = str(cfg.kernel)
+        bandwidth_req = float(cfg.kernel_bandwidth)
+
+        # Linear kernel: K = I, k-ρPCA reduces to ρPCA. Useful as a sanity check.
+        if kernel == "linear":
+            n_t = X_target_std.shape[0]
+            return np.eye(n_t, dtype=np.float64), {
+                "source": source, "kernel": "linear", "bandwidth": float("nan"),
+            }
+
+        # Build the pairwise distance vector based on source.
+        if source == "embedding":
+            distances = pdist(X_target_std, metric="euclidean")
+        elif source == "similarity":
+            sim = getattr(cfg, "kernel_similarity_matrix", None)
+            if sim is None:
+                raise ValueError(
+                    "kernel_source='similarity' requires a precomputed "
+                    "similarity matrix in the embedding bundle. Pass "
+                    "--similarity to protspace prepare so MMseqs2 is run, "
+                    "or use kernel_source='embedding' or 'precomputed'."
+                )
+            sim = np.asarray(sim, dtype=np.float64)
+            if sim.shape != (X_target_std.shape[0], X_target_std.shape[0]):
+                raise ValueError(
+                    f"Similarity matrix shape {sim.shape} does not match "
+                    f"target size {X_target_std.shape[0]}."
+                )
+            sim_clipped = np.clip(sim, 0.0, 1.0)
+            np.fill_diagonal(sim_clipped, 1.0)
+            distance_full = 1.0 - sim_clipped
+            distances = squareform(distance_full, checks=False)
+        elif source == "precomputed":
+            K_raw = getattr(cfg, "kernel_precomputed_matrix", None)
+            if K_raw is None:
+                raise ValueError(
+                    "kernel_source='precomputed' requires a kernel matrix via "
+                    "--kppca-kernel-path."
+                )
+            K = np.asarray(K_raw, dtype=np.float64)
+            if K.shape != (X_target_std.shape[0], X_target_std.shape[0]):
+                raise ValueError(
+                    f"Precomputed kernel shape {K.shape} does not match "
+                    f"target size {X_target_std.shape[0]}."
+                )
+            K = 0.5 * (K + K.T)
+            return K, {
+                "source": "precomputed", "kernel": "precomputed",
+                "bandwidth": float("nan"),
+            }
+        else:
+            raise ValueError(f"Unknown kernel_source: {source!r}")
+
+        # Resolve bandwidth and apply kernel function.
+        if kernel == "gaussian":
+            if bandwidth_req > 0.0:
+                bandwidth = bandwidth_req
+            else:
+                # rhopca reference heuristic: sqrt(median(distances)).
+                bandwidth = float(np.sqrt(np.median(distances)))
+                if bandwidth <= 0.0:
+                    raise ValueError(
+                        "Auto bandwidth resolved to 0 — pairwise distances are "
+                        "all zero (degenerate target). Set --kppca-kernel-bandwidth."
+                    )
+            weights = np.exp(-(distances ** 2) / (2.0 * bandwidth ** 2))
+        elif kernel == "inverse_distance":
+            weights = 1.0 / (distances + 1e-6)
+            bandwidth = float("nan")
+        else:
+            raise ValueError(f"Unknown kernel: {kernel!r}")
+
+        K = squareform(weights, checks=False)
+        np.fill_diagonal(K, 1.0)
+        return K, {"source": source, "kernel": kernel, "bandwidth": bandwidth}
+
+    def get_params(self) -> dict[str, Any]:
+        params = super().get_params()
+        params.update({
+            "kernel": str(self.config.kernel),
+            "kernel_source": str(self.config.kernel_source),
+            "kernel_bandwidth_requested": float(self.config.kernel_bandwidth),
+            "background_kernel": bool(self.config.background_kernel),
+        })
+        if hasattr(self, "kernel_bandwidth_"):
+            params["kernel_bandwidth_used"] = self.kernel_bandwidth_
+        if hasattr(self, "kernel_n_samples_"):
+            params["kernel_n_samples"] = int(self.kernel_n_samples_)
+        return params

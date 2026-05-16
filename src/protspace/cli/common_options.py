@@ -22,6 +22,18 @@ class BackgroundStrategy(str, Enum):
     outlier = "outlier"
 
 
+class Kernel(str, Enum):
+    gaussian = "gaussian"
+    inverse_distance = "inverse_distance"
+    linear = "linear"
+
+
+class KernelSource(str, Enum):
+    embedding = "embedding"
+    similarity = "similarity"
+    precomputed = "precomputed"
+
+
 # ---------------------------------------------------------------------------
 # Shared option types
 # ---------------------------------------------------------------------------
@@ -115,8 +127,6 @@ Opt_Eps = Annotated[
     float,
     typer.Option(help="MDS convergence tolerance.", rich_help_panel="Projection"),
 ]
-
-# ρPCA-specific options
 Opt_RegularizationMu = Annotated[
     float,
     typer.Option(
@@ -183,14 +193,74 @@ Opt_StandardScale = Annotated[
         rich_help_panel="Projection",
     ),
 ]
-
+Opt_KppcaKernel = Annotated[
+    Kernel,
+    typer.Option(
+        "--kppca-kernel",
+        help=(
+            "k-ρPCA kernel function. 'gaussian' uses exp(-d²/2h²) with "
+            "bandwidth h (see --kppca-kernel-bandwidth); 'inverse_distance' "
+            "uses 1/(d+ε); 'linear' uses K=I (reduces to ρPCA, sanity check)."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_KppcaKernelSource = Annotated[
+    KernelSource,
+    typer.Option(
+        "--kppca-kernel-source",
+        help=(
+            "Source of pairwise distances for the k-ρPCA kernel matrix. "
+            "'embedding' (default) uses pairwise Euclidean distances in the "
+            "standardised target embedding space — emphasises local pLM "
+            "neighbourhoods. 'similarity' uses 1 - MMseqs2 identity from a "
+            "similarity matrix (requires --similarity). 'precomputed' loads "
+            "the matrix from --kppca-kernel-path."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_KppcaKernelBandwidth = Annotated[
+    float,
+    typer.Option(
+        "--kppca-kernel-bandwidth",
+        help=(
+            "k-ρPCA Gaussian kernel bandwidth h. 0 (default) auto-resolves "
+            "to sqrt(median pairwise distance) per the rhopca reference "
+            "heuristic. Ignored for non-Gaussian kernels."
+        ),
+        rich_help_panel="Projection",
+        min=0.0,
+    ),
+]
+Opt_KppcaKernelPath = Annotated[
+    Path | None,
+    typer.Option(
+        "--kppca-kernel-path",
+        help=(
+            "Path to an n_T × n_T precomputed kernel matrix (.npy, .h5, or "
+            ".parquet). Only used when --kppca-kernel-source=precomputed."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_KppcaBackgroundKernel = Annotated[
+    bool,
+    typer.Option(
+        "--kppca-background-kernel/--no-kppca-background-kernel",
+        help=(
+            "Apply the kernel matrix to the background covariance too. "
+            "Off by default — paper 2 keeps Σ_B unweighted."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
 Opt_BatchSize = Annotated[
     int,
     typer.Option(
         help="Sequences per Biocentral API call.", rich_help_panel="Embedding"
     ),
 ]
-
 Opt_Fasta = Annotated[
     Path | None,
     typer.Option(

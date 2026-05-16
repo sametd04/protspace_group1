@@ -22,7 +22,7 @@ from protspace.data.loaders.embedding_set import (
 )
 from protspace.data.processors.base_processor import BaseProcessor
 from protspace.utils import get_reducers
-from protspace.utils.constants import MDS_NAME, PPCA_NAME
+from protspace.utils.constants import KPPCA_NAME, MDS_NAME, PPCA_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ class ReducerParams:
     max_iter: int = 300
     eps: float = 1e-6
 
-    # ρPCA-specific parameters
+    # ρPCA
     regularization_mu: float = 1e-3
     background_ratio: float = 0.3
     background_strategy: str = "outlier"
@@ -51,6 +51,13 @@ class ReducerParams:
     # Path to external background HDF5. When set, takes precedence over
     # background_strategy and forces strategy="external" in the reducer.
     background_path: str = ""
+
+    # k-ρPCA
+    kernel: str = "gaussian"
+    kernel_source: str = "embedding"
+    kernel_bandwidth: float = 0.0
+    background_kernel: bool = False
+    kernel_path: str = ""  # for kernel_source="precomputed"
 
 
 @dataclass(frozen=True)
@@ -205,6 +212,45 @@ def _load_background_h5(path: Path) -> np.ndarray:
     return arr
 
 
+def _load_kernel_matrix(path: Path) -> np.ndarray:
+    """Load an n × n kernel/similarity matrix from .npy, .h5, or .parquet.
+
+    For HDF5: reads the first 2D dataset found. For parquet: reads the table
+    and discards an 'identifier' column if present.
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".npy":
+        K = np.load(path)
+    elif suffix in (".h5", ".hdf5"):
+        import h5py
+        with h5py.File(path, "r") as f:
+            keys = list(f.keys())
+            if not keys:
+                raise ValueError(f"No datasets in {path}.")
+            K = np.asarray(f[keys[0]])
+    elif suffix == ".parquet":
+        import pyarrow.parquet as pq
+        table = pq.read_table(str(path)).to_pandas()
+        if "identifier" in table.columns:
+            table = table.drop(columns=["identifier"])
+        K = table.to_numpy()
+    else:
+        raise ValueError(
+            f"Unsupported kernel file format {suffix!r}. "
+            "Use .npy, .h5, or .parquet."
+        )
+    K = np.asarray(K, dtype=np.float64)
+    if K.ndim != 2 or K.shape[0] != K.shape[1]:
+        raise ValueError(
+            f"Kernel matrix must be square, got shape {K.shape}."
+        )
+    logger.info(
+        "Loaded ρPCA kernel: %d × %d from %s",
+        K.shape[0], K.shape[1], path,
+    )
+    return K
+
+
 class ReductionPipeline:
     """Unified pipeline: load → annotate → reduce → output."""
 
@@ -215,6 +261,8 @@ class ReductionPipeline:
         # Lazy cache for the external background — loaded once per run if
         # background_path is set and any method needs it.
         self._background_cache: np.ndarray | None = None
+        # Same for external similarity matrix for k-ρPCA.
+        self._similarity_matrix_cache: np.ndarray | None = None
 
     def run(self, embedding_sets: list[EmbeddingSet]) -> Path:
         if not embedding_sets:
@@ -605,6 +653,35 @@ class ReductionPipeline:
         params.pop("background_path", None)
         return params
 
+
+    def _prepare_kppca_params(self, effective_params: dict) -> dict:
+        """Resolve k-ρPCA kernel inputs in effective params.
+
+        Inherits all PPCA preparation (external background, etc.), then attaches
+        either a precomputed kernel matrix or — for kernel_source='similarity' —
+        a sequence-similarity matrix from the run.
+        """
+        params = self._prepare_ppca_params(effective_params)  # handle background first
+
+        source = params.get("kernel_source", "embedding")
+        if source == "precomputed":
+            path_str = params.get("kernel_path", "") or ""
+            if not path_str:
+                raise ValueError(
+                    "kppca with kernel_source='precomputed' requires --kppca-kernel-path."
+                )
+            params["kernel_precomputed_matrix"] = _load_kernel_matrix(Path(path_str))
+        elif source == "similarity":
+            sim = self._similarity_matrix_cache
+            if sim is None:
+                raise ValueError(
+                    "kppca with kernel_source='similarity' requires --similarity "
+                    "(MMseqs2). Pass -s/--similarity and -f FASTA at the CLI."
+                )
+            params["kernel_similarity_matrix"] = sim
+        params.pop("kernel_path", None)
+        return params
+
     # --- Dimensionality reduction ---
 
     def _run_reductions(
@@ -624,6 +701,7 @@ class ReductionPipeline:
 
         for emb_set in embedding_sets:
             if emb_set.precomputed:
+                self._similarity_matrix_cache = emb_set.data
                 cached = self._load_cached_projection(
                     emb_set.name, MDS_NAME, 2, global_params
                 )
@@ -667,6 +745,14 @@ class ReductionPipeline:
                             "background dataset for best results.",
                             effective_params.get("background_strategy"),
                             effective_params.get("background_ratio", 0.0),
+                        )
+                        ppca_warned = True
+                elif method == KPPCA_NAME:
+                    effective_params = self._prepare_kppca_params(effective_params)
+                    if effective_params.get("background_data") is None and not ppca_warned:
+                        logger.warning(
+                            "k-ρPCA: no external background; falling back to auto-split '%s'.",
+                            effective_params.get("background_strategy"),
                         )
                         ppca_warned = True
 

@@ -46,18 +46,25 @@ class BaseProcessor:
             "background_ratio",
             "background_strategy",
             "standard_scale",
+            "kernel", 
+            "kernel_source", 
+            "kernel_bandwidth", 
+            "background_kernel",
         }
         filtered_config = {
             k: v for k, v in self.config.items() if k in valid_config_keys
         }
         config = DimensionReductionConfig(n_components=dims, **filtered_config)
 
-        # ρPCA-only side channel for the external background ndarray.
-        # DimensionReductionConfig is frozen, so we attach via __setattr__
-        # on the underlying dict. The reducer reads it with
-        # getattr(cfg, "background_data", None).
-        if "background_data" in self.config and self.config["background_data"] is not None:
-            object.__setattr__(config, "background_data", self.config["background_data"])
+        # Side channels for non-primitive data types (arrays/matrices).
+        # DimensionReductionConfig is frozen, so we attach via object.__setattr__.
+        for side_key in (
+            "background_data", 
+            "kernel_precomputed_matrix",
+            "kernel_similarity_matrix"
+        ):
+            if side_key in self.config and self.config[side_key] is not None:
+                object.__setattr__(config, side_key, self.config[side_key])  
 
         # Special handling for MDS when using similarity matrix
         if method == MDS_NAME and config.precomputed is True:

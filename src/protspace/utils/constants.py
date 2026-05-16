@@ -14,6 +14,7 @@ PACMAP_NAME = "pacmap"
 MDS_NAME = "mds"
 LOCALMAP_NAME = "localmap"
 PPCA_NAME = "ppca"
+KPPCA_NAME = "kppca"
 
 REDUCER_METHODS = [
     PCA_NAME,
@@ -23,16 +24,20 @@ REDUCER_METHODS = [
     MDS_NAME,
     LOCALMAP_NAME,
     PPCA_NAME,
+    KPPCA_NAME
 ]
 
 # Metric types
 METRIC_TYPES = Literal["euclidean", "cosine"]
 
-# ρPCA background selection strategies.
-# "external" is selected automatically when a background dataset is provided
-# via --ppca-background; the other three are auto-split policies on the
-# target data and are useful when no external background exists.
+# ρPCA background selection strategies. "external" is selected automatically
+# when a background dataset is provided via --ppca-background; the other three
+# are auto-split policies on the target data.
 BACKGROUND_STRATEGY_TYPES = Literal["external", "random", "uniform", "outlier"]
+
+# k-ρPCA kernel sources and kernel functions
+KERNEL_SOURCE_TYPES = Literal["embedding", "similarity", "precomputed"]
+KERNEL_TYPES = Literal["gaussian", "inverse_distance", "linear"]
 
 
 @dataclass(frozen=True)
@@ -68,6 +73,7 @@ class DimensionReductionConfig:
             covariances. Matches the Carilli/Jackson/Pachter convention.
             Strongly recommended for PLM embeddings whose dimensions have
             heterogeneous scale.
+        kernel, kernel_source, kernel_bandwidth and background_kernel: consumed by k-ρPCA
     """
 
     n_components: int = field(default=2, metadata={"allowed": [2, 3]})
@@ -86,7 +92,7 @@ class DimensionReductionConfig:
     eps: float = field(default=1e-3, metadata={"gt": 0})
     random_state: int = field(default=42, metadata={"gte": 0})
 
-    # ρPCA-specific parameters
+    # ρPCA parameters
     regularization_mu: float = field(default=1e-3, metadata={"gte": 0})
     background_ratio: float = field(default=0.3, metadata={"gt": 0, "lt": 1})
     background_strategy: BACKGROUND_STRATEGY_TYPES = field(
@@ -94,6 +100,21 @@ class DimensionReductionConfig:
         metadata={"allowed": list(get_args(BACKGROUND_STRATEGY_TYPES))},
     )
     standard_scale: bool = field(default=True)
+
+    # k-ρPCA parameters
+    kernel: KERNEL_TYPES = field(
+        default="gaussian",
+        metadata={"allowed": list(get_args(KERNEL_TYPES))},
+    )
+    kernel_source: KERNEL_SOURCE_TYPES = field(
+        default="embedding",
+        metadata={"allowed": list(get_args(KERNEL_SOURCE_TYPES))},
+    )
+    # kernel_bandwidth=0 means "auto" (sqrt(median pairwise distance), the
+    # rhopca reference heuristic). Any positive value is used literally.
+    kernel_bandwidth: float = field(default=0.0, metadata={"gte": 0})
+    background_kernel: bool = field(default=False)
+    
 
     def __post_init__(self):
         """Validate configuration parameters."""
