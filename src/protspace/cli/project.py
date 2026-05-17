@@ -52,6 +52,16 @@ def project(
             "-o", "--output", help="Output directory for projection parquet files."
         ),
     ] = Path("."),
+    annotations_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--annotations-file",
+            help=(
+                "Optional parquet file with annotation columns. If provided, "
+                "it is embedded into the generated data.parquetbundle."
+            ),
+        ),
+    ] = None,
     similarity: Opt_Similarity = False,
     fasta: Opt_Fasta = None,
     metric: Opt_Metric = Metric.euclidean,
@@ -82,8 +92,10 @@ def project(
 
     from collections import Counter
 
+    import pandas as pd
     import pyarrow.parquet as pq
 
+    from protspace.data.io.bundle import write_bundle
     from protspace.cli.prepare import _parse_input_specs
     from protspace.data.loaders import EmbeddingSet, compute_similarity, load_h5
     from protspace.data.loaders.embedding_set import format_projection_name
@@ -198,8 +210,28 @@ def project(
 
     metadata_table = base._create_projections_metadata_table(all_reductions)
     data_table = base._create_projections_data_table(all_reductions, headers)
+    if annotations_file:
+        annotations_table = pq.read_table(str(annotations_file))
+        if "identifier" in annotations_table.column_names and "protein_id" not in annotations_table.column_names:
+            annotations_table = annotations_table.rename_columns(
+                [
+                    "protein_id" if col == "identifier" else col
+                    for col in annotations_table.column_names
+                ]
+            )
+    else:
+        annotations_table = base._create_protein_annotations_table(
+            pd.DataFrame({"identifier": headers})
+        )
 
     pq.write_table(metadata_table, str(output / "projections_metadata.parquet"))
     pq.write_table(data_table, str(output / "projections_data.parquet"))
+    write_bundle(
+        [annotations_table, metadata_table, data_table],
+        output / "data.parquetbundle",
+    )
 
-    typer.echo(f"Saved {len(all_reductions)} projections to {output}")
+    typer.echo(
+        f"Saved {len(all_reductions)} projections to {output} "
+        f"and bundled output to {output / 'data.parquetbundle'}"
+    )

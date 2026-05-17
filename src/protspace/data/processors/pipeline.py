@@ -212,9 +212,10 @@ class ReductionPipeline:
         self.config = config
         reducer_dict = asdict(config.reducer_params)
         self.base = BaseProcessor(reducer_dict, get_reducers())
-        # Lazy cache for the external background — loaded once per run if
-        # background_path is set and any method needs it.
-        self._background_cache: np.ndarray | None = None
+        # Lazy cache for external ρPCA backgrounds, keyed by absolute path.
+        # This supports both global --ppca-background and per-method
+        # background_path overrides in method specs.
+        self._background_cache: dict[str, np.ndarray] = {}
 
     def run(self, embedding_sets: list[EmbeddingSet]) -> Path:
         if not embedding_sets:
@@ -567,14 +568,14 @@ class ReductionPipeline:
 
     # --- ρPCA background loading ---
 
-    def _get_background_data(self) -> np.ndarray | None:
-        """Load the external ρPCA background (cached after first call)."""
-        path_str = self.config.reducer_params.background_path
+    def _get_background_data(self, path_str: str) -> np.ndarray | None:
+        """Load an external ρPCA background (cached by path)."""
         if not path_str:
             return None
-        if self._background_cache is None:
-            self._background_cache = _load_background_h5(Path(path_str))
-        return self._background_cache
+        key = str(Path(path_str).expanduser().resolve())
+        if key not in self._background_cache:
+            self._background_cache[key] = _load_background_h5(Path(path_str))
+        return self._background_cache[key]
 
     def _prepare_ppca_params(
         self, effective_params: dict[str, Any]
@@ -590,7 +591,7 @@ class ReductionPipeline:
         path_str = params.get("background_path", "") or ""
         if path_str:
             params["background_strategy"] = "external"
-            params["background_data"] = self._get_background_data()
+            params["background_data"] = self._get_background_data(path_str)
         elif params.get("background_strategy") not in (
             "random",
             "uniform",
