@@ -10,6 +10,7 @@
 
 # Project-specific
 /docs/publication
+/output/
 
 # --- generated artifacts (outside data/) ---
 **/pdb/
