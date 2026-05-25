@@ -19,6 +19,7 @@ from collections.abc import Callable
 import numpy as np
 from sklearn.manifold import trustworthiness as sklearn_trustworthiness
 from sklearn.metrics import silhouette_score as sklearn_silhouette
+from sklearn.neighbors import NearestNeighbors
 
 
 def calculate_trustworthiness(
@@ -44,6 +45,66 @@ def calculate_trustworthiness(
     except ValueError as e:
         warnings.warn(f"Trustworthiness calculation failed: {e}", stacklevel=2)
         return float("nan")
+
+
+def calculate_knn_overlap(
+    projection_a: np.ndarray, projection_b: np.ndarray, n_neighbors: int = 15
+) -> float:
+    """Compute k-NN overlap between two projections.
+
+    Measures how many of the k nearest neighbors are preserved between
+    two different projections of the same data. This quantifies embedding
+    stability under perturbations (e.g., different random seeds or
+    hyperparameters).
+
+    Range ``[0, 1]``, higher = better. ``1`` = all neighbors perfectly
+    preserved across projections.
+
+    Parameters
+    ----------
+    projection_a
+        First projection (n_samples, n_dims)
+    projection_b
+        Second projection (n_samples, n_dims)
+    n_neighbors
+        Number of nearest neighbors to consider
+
+    Returns
+    -------
+    Mean k-NN overlap score across all points
+    """
+    if projection_a.shape != projection_b.shape:
+        raise ValueError(
+            f"Projections must have same shape, "
+            f"got {projection_a.shape} vs {projection_b.shape}"
+        )
+
+    n_samples = projection_a.shape[0]
+    if n_samples < 3:
+        return float("nan")
+
+    k = min(n_neighbors, n_samples - 1)  # Exclude self
+
+    # Find k nearest neighbors in both projections
+    nbrs_a = NearestNeighbors(n_neighbors=k + 1, metric="euclidean").fit(projection_a)
+    nbrs_b = NearestNeighbors(n_neighbors=k + 1, metric="euclidean").fit(projection_b)
+
+    _, indices_a = nbrs_a.kneighbors(projection_a)
+    _, indices_b = nbrs_b.kneighbors(projection_b)
+
+    # Remove self (first neighbor) and keep only k neighbors
+    indices_a = indices_a[:, 1:]
+    indices_b = indices_b[:, 1:]
+
+    # Compute overlap for each point
+    overlaps = []
+    for i in range(n_samples):
+        neighbors_a = set(indices_a[i])
+        neighbors_b = set(indices_b[i])
+        overlap = len(neighbors_a & neighbors_b) / k
+        overlaps.append(overlap)
+
+    return float(np.mean(overlaps))
 
 
 def calculate_silhouette_score(
