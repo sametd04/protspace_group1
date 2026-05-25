@@ -3,23 +3,28 @@
 
 # IDE / tools
 /.vscode
+/.uv-bin
 /.claude
 /.playwright-mcp
 /.ruff_cache
 
 # Project-specific
 /docs/publication
+/output/
 
-# --- data ---
-# Ignore all data directories except 3FTx, Pla2g2, and toxins
-/data/*
-!/data/3FTx
-!/data/Pla2g2
-!/data/toxins
-# Always ignore pdb subdirectories, tmp subdirectories, and .h5 files everywhere
+# --- generated artifacts (outside data/) ---
 **/pdb/
 **/tmp/
 **/*.h5
+**/*.npy
+
+# Keep all dataset files versioned
+!/data/**
+
+# Never commit benchmark outputs
+**/metrics.csv
+**/*.pargquet
+**/*.parquetbundle
 
 # Python bytecode
 __pycache__/

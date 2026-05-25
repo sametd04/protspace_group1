@@ -1,0 +1,4 @@
+method,knn_accuracy
+PCA,0.7373
+UMAP,0.9183
+pPCA-ToxProt,0.7395

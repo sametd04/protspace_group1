@@ -1,6 +1,7 @@
 """Biocentral API embedding logic."""
 
 import logging
+import os
 import sys
 import time
 import warnings
@@ -39,6 +40,8 @@ EXTRA_SHORT_KEYS: dict[str, str] = {
 ALL_SHORT_KEYS: dict[str, str] = {**MODEL_SHORT_KEYS, **EXTRA_SHORT_KEYS}
 
 DEFAULT_EMBEDDER = "prot_t5"
+DEFAULT_LOCAL_SERVER_URL = "http://localhost:9540"
+DEFAULT_REMOTE_SERVER_URL = "https://biocentral.rostlab.org"
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,9 @@ class EmbedConfig:
     """Embedding parameters for Biocentral API calls."""
 
     batch_size: int = 1000
+    task_poll_interval_seconds: int = 2
+    task_max_wait_seconds: int = 300
+    max_consecutive_poll_failures: int = 10
 
 
 # Reverse lookup: full model name → short key
@@ -104,6 +110,51 @@ def derive_h5_cache_path(fasta_path: Path, embedder: str) -> Path:
     """Derive default HDF5 cache path: ``{stem}_{short_key}.h5`` next to FASTA."""
     short = _FULL_TO_SHORT.get(embedder, embedder.replace("/", "_"))
     return fasta_path.with_name(f"{fasta_path.stem}_{short}.h5")
+
+
+def _is_local_url(url: str) -> bool:
+    return "localhost" in url or "127.0.0.1" in url
+
+
+def _connect_biocentral_api() -> BiocentralAPI:
+    """Connect to Biocentral with local-first fallback to remote."""
+    local_only = os.getenv("BIOCENTRAL_LOCAL_ONLY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    local_url = os.getenv("BIOCENTRAL_LOCAL_URL", "").strip() or DEFAULT_LOCAL_SERVER_URL
+    remote_url = (
+        os.getenv("BIOCENTRAL_SERVER_URL", "").strip() or DEFAULT_REMOTE_SERVER_URL
+    )
+
+    candidate_urls = [local_url] if local_only else [local_url, remote_url]
+    # Preserve order while removing duplicates.
+    seen = set()
+    ordered_candidates = []
+    for url in candidate_urls:
+        if url and url not in seen:
+            seen.add(url)
+            ordered_candidates.append(url)
+
+    health_wait_seconds = int(os.getenv("BIOCENTRAL_HEALTH_WAIT_SECONDS", "30"))
+    last_error: Exception | None = None
+    for server_url in ordered_candidates:
+        logger.info("Trying Biocentral server: %s", server_url)
+        api = BiocentralAPI(
+            fixed_server_url=server_url, local_only=_is_local_url(server_url)
+        )
+        try:
+            return api.wait_until_healthy(max_wait_seconds=health_wait_seconds)
+        except TimeoutError as exc:
+            last_error = exc
+            logger.warning("Biocentral not reachable at %s", server_url)
+
+    raise RuntimeError(
+        "Biocentral not reachable. Tried local first, then remote fallback. "
+        "Set BIOCENTRAL_LOCAL_URL/BIOCENTRAL_SERVER_URL if needed."
+    ) from last_error
 
 
 # ---------------------------------------------------------------------------
@@ -195,8 +246,7 @@ def embed_sequences(
 
     # Connect to Biocentral
     logger.info("Connecting to Biocentral server...")
-    api = BiocentralAPI(fixed_server_url="https://biocentral.rostlab.org")
-    api = api.wait_until_healthy(max_wait_seconds=30)
+    api = _connect_biocentral_api()
     logger.info("Server is healthy")
 
     # Batch and embed
@@ -216,11 +266,17 @@ def embed_sequences(
                     message=".*longer than the recommended.*",
                     category=UserWarning,
                 )
-                result = api.embed(
+                task = api.embed(
                     embedder_name=embedder,
                     sequence_data=batch_seqs,
                     reduce=True,
-                ).run()
+                )
+                task.TIMEOUT = cfg.task_poll_interval_seconds
+                task.MAX_TRIES = max(
+                    1, cfg.task_max_wait_seconds // cfg.task_poll_interval_seconds
+                )
+                task.MAX_CONSECUTIVE_FAILURES = cfg.max_consecutive_poll_failures
+                result = task.run_with_progress()
 
             if result is not None:
                 emb_dict = result.to_dict()
@@ -293,8 +349,7 @@ def probe_embedder(
     for pid, seq in probe_seqs.items():
         print(f"  {pid}: {seq[:40]}{'...' if len(seq) > 40 else ''} ({len(seq)} aa)")
 
-    api = BiocentralAPI(fixed_server_url="https://biocentral.rostlab.org")
-    api = api.wait_until_healthy(max_wait_seconds=30)
+    api = _connect_biocentral_api()
 
     result = api.embed(
         embedder_name=embedder,
