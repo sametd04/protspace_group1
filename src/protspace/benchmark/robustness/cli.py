@@ -5,17 +5,17 @@ Tests stability of dimensionality reduction methods using k-NN overlap metrics.
 Supports: UMAP, t-SNE, PaCMAP, LocalMAP, MDS
 
 Usage:
-    # Run for specific method
-    uv run python src/protspace/benchmark/run_robustness.py --methods umap
+    # Run all methods with automatic plotting (recommended)
+    uv run python -m protspace.benchmark.robustness.cli --methods all --plot
 
-    # Run for multiple methods
-    uv run python src/protspace/benchmark/run_robustness.py --methods umap tsne
+    # Run specific methods with plotting
+    uv run python -m protspace.benchmark.robustness.cli --methods umap tsne --plot
 
-    # Run all methods
-    uv run python src/protspace/benchmark/run_robustness.py --methods all
+    # Run experiments only (no plot)
+    uv run python -m protspace.benchmark.robustness.cli --methods all
 
-    # Specify dataset
-    uv run python src/protspace/benchmark/run_robustness.py --methods all --dataset 3ftx
+    # Generate plot from existing results
+    uv run python -m protspace.benchmark.robustness.cli --skip-experiments --plot
 """
 
 from __future__ import annotations
@@ -35,17 +35,20 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run robustness for UMAP only
-  python cli.py --methods umap
+  # Run all methods with automatic plotting (recommended)
+  uv run python -m protspace.benchmark.robustness.cli --methods all --plot
 
-  # Run robustness for multiple specific methods (with auto-plot)
-  python cli.py --methods umap tsne pacmap --plot
+  # Run specific methods with plotting
+  uv run python -m protspace.benchmark.robustness.cli --methods umap tsne --plot
 
-  # Run robustness for all methods and generate comparison plot
-  python cli.py --methods all --plot
+  # Run experiments only (no visualization)
+  uv run python -m protspace.benchmark.robustness.cli --methods all
+
+  # Generate plot from existing results (skip experiments)
+  uv run python -m protspace.benchmark.robustness.cli --skip-experiments --plot
 
   # Use a different dataset
-  python cli.py --methods all --dataset toxprot --plot
+  uv run python -m protspace.benchmark.robustness.cli --methods all --dataset toxprot --plot
         """,
     )
 
