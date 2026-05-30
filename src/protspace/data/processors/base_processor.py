@@ -47,9 +47,9 @@ class BaseProcessor:
             "standard_scale",
             "samples_per_target",
             "n_length_bins",
-            "kernel", 
-            "kernel_source", 
-            "kernel_bandwidth", 
+            "kernel",
+            "kernel_source",
+            "kernel_bandwidth",
             "background_kernel",
         }
         filtered_config = {
@@ -57,18 +57,20 @@ class BaseProcessor:
         }
         config = DimensionReductionConfig(n_components=dims, **filtered_config)
 
-        # Side channels for dynamic metadata and non-primitive data types.
-        # DimensionReductionConfig is frozen, so we attach via object.__setattr__.
+        # Side channels for dynamic metadata and non-primitive data types
+        # (ndarrays, pandas frames, dicts). DimensionReductionConfig is
+        # frozen, so we attach via object.__setattr__.
         for side_key in (
-            "background_data", 
+            "background_data",
+            "target_data",
             "background_source",
             "background_n_samples",
             "background_details",
             "kernel_precomputed_matrix",
-            "kernel_similarity_matrix"
+            "kernel_similarity_matrix",
         ):
             if side_key in self.config and self.config[side_key] is not None:
-                object.__setattr__(config, side_key, self.config[side_key])  
+                object.__setattr__(config, side_key, self.config[side_key])
 
         # Special handling for MDS when using similarity matrix
         if method == MDS_NAME and config.precomputed is True:

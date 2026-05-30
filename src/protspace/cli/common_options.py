@@ -12,12 +12,10 @@ class Metric(str, Enum):
     cosine = "cosine"
     manhattan = "manhattan"
 
-
 class Kernel(str, Enum):
     gaussian = "gaussian"
     inverse_distance = "inverse_distance"
     linear = "linear"
-
 
 class KernelSource(str, Enum):
     embedding = "embedding"
@@ -30,11 +28,7 @@ class PpcaStrategy(str, Enum):
     length_matched = "length_matched"
     stratified = "stratified"
     mixed = "mixed"
-
-
-# ---------------------------------------------------------------------------
-# Shared option types
-# ---------------------------------------------------------------------------
+    isolate = "isolate"
 
 Opt_Verbose = Annotated[
     int,
@@ -46,21 +40,13 @@ Opt_Methods = Annotated[
     typer.Option(
         "-m",
         "--methods",
-        help=(
-            "DR methods. Comma-sep or repeat: -m pca2,umap2 or -m pca2 -m umap2. "
-            "Inline params: -m 'umap2:n_neighbors=50;min_dist=0.1'."
-        ),
+        help="DR methods. Comma-sep or repeat: -m pca2,umap2 or -m pca2 -m umap2. Inline params: -m 'umap2:n_neighbors=50;min_dist=0.1'.",
         rich_help_panel="Projection",
     ),
 ]
 Opt_Similarity = Annotated[
     bool,
-    typer.Option(
-        "-s",
-        "--similarity",
-        help="Compute sequence similarity DR via MMseqs2.",
-        rich_help_panel="Projection",
-    ),
+    typer.Option("-s", "--similarity", help="Compute sequence similarity DR via MMseqs2.", rich_help_panel="Projection"),
 ]
 Opt_Metric = Annotated[
     Metric,
@@ -72,25 +58,15 @@ Opt_RandomState = Annotated[
 ]
 Opt_NNeighbors = Annotated[
     int,
-    typer.Option(
-        help="UMAP/PaCMAP/LocalMAP neighbors. Larger=more global.",
-        rich_help_panel="Projection",
-        min=2,
-    ),
+    typer.Option(help="UMAP/PaCMAP/LocalMAP neighbors. Larger=more global.", rich_help_panel="Projection", min=2),
 ]
 Opt_MinDist = Annotated[
     float,
-    typer.Option(
-        help="UMAP min distance.", rich_help_panel="Projection", min=0.0, max=0.99
-    ),
+    typer.Option(help="UMAP min distance.", rich_help_panel="Projection", min=0.0, max=0.99),
 ]
 Opt_Perplexity = Annotated[
     float,
-    typer.Option(
-        help="t-SNE perplexity. Should be < n_samples/3.",
-        rich_help_panel="Projection",
-        min=5.0,
-    ),
+    typer.Option(help="t-SNE perplexity. Should be < n_samples/3.", rich_help_panel="Projection", min=5.0),
 ]
 Opt_LearningRate = Annotated[
     float,
@@ -98,20 +74,11 @@ Opt_LearningRate = Annotated[
 ]
 Opt_MnRatio = Annotated[
     float,
-    typer.Option(
-        help="PaCMAP/LocalMAP mid-near ratio.",
-        rich_help_panel="Projection",
-        min=0.0,
-        max=1.0,
-    ),
+    typer.Option(help="PaCMAP/LocalMAP mid-near ratio.", rich_help_panel="Projection", min=0.0, max=1.0),
 ]
 Opt_FpRatio = Annotated[
     float,
-    typer.Option(
-        help="PaCMAP/LocalMAP further ratio.",
-        rich_help_panel="Projection",
-        min=0.0,
-    ),
+    typer.Option(help="PaCMAP/LocalMAP further ratio.", rich_help_panel="Projection", min=0.0),
 ]
 Opt_NInit = Annotated[
     int,
@@ -129,12 +96,7 @@ Opt_RegularizationMu = Annotated[
     float,
     typer.Option(
         "--regularization-mu",
-        help=(
-            "ρPCA Tikhonov regularization μ added to the background "
-            "covariance Σ_B. Must be ≥ 0. Default 1e-3 is safe for PLM "
-            "embeddings; reduce to 0 only if the background is well-"
-            "conditioned (n_background ≫ n_features)."
-        ),
+        help="ρPCA Tikhonov regularization μ added to the background covariance Σ_B. Default 1e-3.",
         rich_help_panel="Projection",
         min=0.0,
     ),
@@ -143,12 +105,7 @@ Opt_PpcaBackground = Annotated[
     Path | None,
     typer.Option(
         "--ppca-background",
-        help=(
-            "Path to an HDF5 file holding background embeddings for ρPCA "
-            "(canonical mode per Carilli/Jackson/Pachter 2025). Must have "
-            "the same embedding dimension as the target. Identifiers are "
-            "not required to overlap with the target."
-        ),
+        help="Path to an HDF5 file holding background embeddings for ρPCA (e.g. SwissProt). Identifiers are not required to overlap with the target.",
         rich_help_panel="Projection",
     ),
 ]
@@ -156,161 +113,42 @@ Opt_StandardScale = Annotated[
     bool,
     typer.Option(
         "--standard-scale/--no-standard-scale",
-        help=(
-            "Per-set standard-scale target and background before computing "
-            "covariances (paper convention). Strongly recommended for PLM "
-            "embeddings whose dimensions have heterogeneous scale."
-        ),
+        help="Per-set standard-scale target and background before computing covariances (paper convention).",
         rich_help_panel="Projection",
     ),
 ]
-Opt_KppcaKernel = Annotated[
-    Kernel,
-    typer.Option(
-        "--kppca-kernel",
-        help=(
-            "k-ρPCA kernel function. 'gaussian' uses exp(-d²/2h²) with "
-            "bandwidth h (see --kppca-kernel-bandwidth); 'inverse_distance' "
-            "uses 1/(d+ε); 'linear' uses K=I (reduces to ρPCA, sanity check)."
-        ),
-        rich_help_panel="Projection",
-    ),
-]
-Opt_KppcaKernelSource = Annotated[
-    KernelSource,
-    typer.Option(
-        "--kppca-kernel-source",
-        help=(
-            "Source of pairwise distances for the k-ρPCA kernel matrix. "
-            "'embedding' (default) uses pairwise Euclidean distances in the "
-            "standardised target embedding space — emphasises local pLM "
-            "neighbourhoods. 'similarity' uses 1 - MMseqs2 identity from a "
-            "similarity matrix (requires --similarity). 'precomputed' loads "
-            "the matrix from --kppca-kernel-path."
-        ),
-        rich_help_panel="Projection",
-    ),
-]
-Opt_KppcaKernelBandwidth = Annotated[
-    float,
-    typer.Option(
-        "--kppca-kernel-bandwidth",
-        help=(
-            "k-ρPCA Gaussian kernel bandwidth h. 0 (default) auto-resolves "
-            "to sqrt(median pairwise distance) per the rhopca reference "
-            "heuristic. Ignored for non-Gaussian kernels."
-        ),
-        rich_help_panel="Projection",
-        min=0.0,
-    ),
-]
-Opt_KppcaKernelPath = Annotated[
-    Path | None,
-    typer.Option(
-        "--kppca-kernel-path",
-        help=(
-            "Path to an n_T × n_T precomputed kernel matrix (.npy, .h5, or "
-            ".parquet). Only used when --kppca-kernel-source=precomputed."
-        ),
-        rich_help_panel="Projection",
-    ),
-]
-Opt_KppcaBackgroundKernel = Annotated[
-    bool,
-    typer.Option(
-        "--kppca-background-kernel/--no-kppca-background-kernel",
-        help=(
-            "Apply the kernel matrix to the background covariance too. "
-            "Off by default — paper 2 keeps Σ_B unweighted."
-        ),
-        rich_help_panel="Projection",
-    ),
-]
+Opt_KppcaKernel = Annotated[Kernel, typer.Option("--kppca-kernel", help="k-ρPCA kernel function.", rich_help_panel="Projection")]
+Opt_KppcaKernelSource = Annotated[KernelSource, typer.Option("--kppca-kernel-source", help="Source of pairwise distances.", rich_help_panel="Projection")]
+Opt_KppcaKernelBandwidth = Annotated[float, typer.Option("--kppca-kernel-bandwidth", help="k-ρPCA Gaussian kernel bandwidth h.", rich_help_panel="Projection", min=0.0)]
+Opt_KppcaKernelPath = Annotated[Path | None, typer.Option("--kppca-kernel-path", help="Path to precomputed kernel matrix.", rich_help_panel="Projection")]
+Opt_KppcaBackgroundKernel = Annotated[bool, typer.Option("--kppca-background-kernel/--no-kppca-background-kernel", help="Apply kernel to background.", rich_help_panel="Projection")]
 Opt_PpcaStrategy = Annotated[
     PpcaStrategy,
     typer.Option(
         "--ppca-strategy",
-        help=(
-            "ρPCA background construction strategy. "
-            "'pool' (default) uses the entire --ppca-background file. "
-            "'complement' splits the input by annotation. "
-            "'length_matched' draws a length-matched control from the pool. "
-            "'stratified' draws a control stratified by --ppca-stratify-by. "
-            "'mixed' combines stratification with length matching."
-        ),
+        help="ρPCA background construction strategy. 'isolate' builds an artifact-only variance background from the pool.",
         rich_help_panel="Projection",
     ),
 ]
-Opt_PpcaTargetAnnotation = Annotated[
-    str | None,
-    typer.Option(
-        "--ppca-target-annotation",
-        help=(
-            "For --ppca-strategy=complement: annotation column that "
-            "identifies target rows in the input."
-        ),
-        rich_help_panel="Projection",
-    ),
-]
-Opt_PpcaTargetValues = Annotated[
-    str | None,
-    typer.Option(
-        "--ppca-target-values",
-        help=(
-            "For --ppca-strategy=complement: comma-separated values in "
-            "--ppca-target-annotation that mark target rows."
-        ),
-        rich_help_panel="Projection",
-    ),
-]
+Opt_PpcaTargetAnnotation = Annotated[str | None, typer.Option("--ppca-target-annotation", help="For --ppca-strategy=complement.", rich_help_panel="Projection")]
+Opt_PpcaTargetValues = Annotated[str | None, typer.Option("--ppca-target-values", help="For --ppca-strategy=complement.", rich_help_panel="Projection")]
 Opt_PpcaStratifyBy = Annotated[
     str | None,
     typer.Option(
         "--ppca-stratify-by",
-        help=(
-            "For --ppca-strategy=stratified or mixed: comma-separated "
-            "annotation columns to stratify the background by. Common "
-            "choices: 'superkingdom', 'signal_peptide'."
-        ),
+        help="For --ppca-strategy=stratified, mixed, or isolate: comma-separated annotation columns to isolate/stratify the background by. E.g. 'signal_peptide'.",
         rich_help_panel="Projection",
     ),
 ]
-Opt_PpcaMatchLength = Annotated[
-    bool,
-    typer.Option(
-        "--ppca-match-length/--no-ppca-match-length",
-        help=(
-            "For --ppca-strategy=mixed: include sequence length as an "
-            "additional stratification axis."
-        ),
-        rich_help_panel="Projection",
-    ),
-]
+Opt_PpcaMatchLength = Annotated[bool, typer.Option("--ppca-match-length/--no-ppca-match-length", help="Include sequence length.", rich_help_panel="Projection")]
 Opt_PpcaSamplesPerTarget = Annotated[
     int,
     typer.Option(
         "--ppca-samples-per-target",
-        help=(
-            "For length_matched / stratified / mixed: number of pool "
-            "samples drawn per target sample. Larger values give a smoother "
-            "Σ_B estimate at the cost of larger background sets."
-        ),
+        help="For length_matched / stratified / mixed / isolate: number of pool samples drawn per target sample.",
         rich_help_panel="Projection",
         min=1,
     ),
 ]
-Opt_BatchSize = Annotated[
-    int,
-    typer.Option(
-        help="Sequences per Biocentral API call.", rich_help_panel="Embedding"
-    ),
-]
-Opt_Fasta = Annotated[
-    Path | None,
-    typer.Option(
-        "-f",
-        "--fasta",
-        help="FASTA for -s/--similarity when input is HDF5.",
-        rich_help_panel="Input",
-    ),
-]
+Opt_BatchSize = Annotated[int, typer.Option(help="Sequences per Biocentral API call.", rich_help_panel="Embedding")]
+Opt_Fasta = Annotated[Path | None, typer.Option("-f", "--fasta", help="FASTA for -s/--similarity when input is HDF5.", rich_help_panel="Input")]

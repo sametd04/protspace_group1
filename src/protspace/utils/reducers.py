@@ -381,19 +381,6 @@ def _solve_rho_eigenproblem(
     convention; see rhopca/utils/misc.py::generalized_eigen). The returned
     eigenvectors are sign-normalized so that, for each axis, the entry of
     largest magnitude is positive.
-
-    Parameters
-    ----------
-    sigma_target : (d, d) float64
-    sigma_background : (d, d) float64
-    n_components : int
-    regularization_mu : float, ≥ 0
-
-    Returns
-    -------
-    eigvals : (k,) float64, descending. k ≤ n_components — fewer if some
-        eigenvalues are filtered out as non-positive.
-    eigvecs : (d, k) float64
     """
     from scipy.linalg import LinAlgError, eigh
 
@@ -458,26 +445,42 @@ def _sample_covariance(centered: np.ndarray) -> np.ndarray:
     return 0.5 * (cov + cov.T)
 
 
+def _project_full_input(
+    data: np.ndarray,
+    X_target: np.ndarray,
+    top_eigvecs: np.ndarray,
+    standard_scale: bool,
+) -> np.ndarray:
+    """Project ALL input rows onto contrastive axes in the target's standardised
+    coordinate frame.
+
+    The pipeline always passes the full input as `data` (one row per protein
+    for visualisation). When the strategy partitions the input — e.g.
+    'complement' — the target subset `X_target` is used to compute Σ_T and
+    define the standardisation. Background-subset and external pool rows
+    are projected through the same standardisation so the resulting plot
+    uses one consistent coordinate system.
+    """
+    target_mean = X_target.mean(axis=0, keepdims=True)
+    if standard_scale:
+        target_std = X_target.std(axis=0, keepdims=True, ddof=1)
+        target_std_safe = np.where(target_std < 1e-12, 1.0, target_std)
+        data_p = (data - target_mean) / target_std_safe
+    else:
+        data_p = data - target_mean
+    return (data_p @ top_eigvecs).astype(np.float64)
+
+
 
 class PPCAReducer(DimensionReducer):
     """ρPCA: contrastive dimension reduction via generalized eigendecomposition.
 
-    Solves Σ_T v = λ Σ_B v for the top n_components eigenvectors.
+    Solves Σ_T v = λ Σ_B v for the top n_components eigenvectors. The
+    target matrix used to compute Σ_T may be a strategy-selected subset of
+    the input; the projection step always covers the FULL input so every
+    protein has visualisation coordinates.
 
-    Background source is determined by config.background_strategy:
-      - "external": use config.background_data (set by the pipeline from
-                    --ppca-background). This is the canonical mode.
-      - "random" / "uniform" / "outlier": auto-split policies on the input.
-
-    Attributes after fit:
-        eigenvalues_ : top eigenvalues, descending. Each is the Rayleigh
-            quotient (target/background variance ratio) along its axis.
-        eigenvectors_ : (d, n_components) generalized eigenvectors.
-        background_indices_ : indices into the input array (auto-split only).
-        background_source_ : "external" or one of the auto-split strategies.
-
-    Solves Σ_T v = λ Σ_B v for the top n_components eigenvectors. See
-    Carilli, Jackson & Pachter 2025 (bioRxiv 2025.11.19.689125) for the
+    See Carilli, Jackson & Pachter 2025 (bioRxiv 2025.11.19.689125) for the
     objective; matches the rhopca reference implementation
     (https://github.com/pachterlab/rhopca) with the following choices:
 
@@ -506,7 +509,7 @@ class PPCAReducer(DimensionReducer):
             data, cfg
         )
 
-        # Per-set standardization (paper convention).
+        # Per-set standardization for the eigenproblem inputs (paper convention).
         if cfg.standard_scale:
             X_target_p = _standard_scale_columns(X_target)
             X_background_p = _standard_scale_columns(X_background)
@@ -535,38 +538,54 @@ class PPCAReducer(DimensionReducer):
         self.eigenvectors_ = top_eigvecs
         self.background_source_ = bg_source
 
-        # Project the standardized target onto top eigenvectors.
-        return (X_target_p @ top_eigvecs).astype(np.float64)
-    
+        # Project all input rows so every protein has 2D coordinates.
+        return _project_full_input(
+            data=data,
+            X_target=X_target,
+            top_eigvecs=top_eigvecs,
+            standard_scale=cfg.standard_scale,
+        )
+
 
     def _resolve_target_background(
             self, data: np.ndarray, cfg
         ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, str]:
-            """Pick the background matrix the pipeline prepared and stashed on cfg.
+            """Resolve target (Σ_T input) and background (Σ_B input) matrices.
 
-            The pipeline owns all the strategy logic now; the reducer's job is to
-            receive a ready-made X_target and X_background pair and solve the
-            eigenproblem on them.
+            `data` is always the FULL input from the pipeline (one row per
+            protein for visualisation). The target subset for computing Σ_T
+            may differ — if cfg.target_data is set, it holds the strategy-
+            selected target subset; otherwise the full `data` IS the target.
             """
             background_data = getattr(cfg, "background_data", None)
             if background_data is None:
                 raise ValueError(
                     "ρPCA requires a prepared background. The pipeline should have "
-                    "attached cfg.background_data via build_background(); this is a "
-                    "configuration error. Pass --ppca-background and "
-                    "--ppca-strategy, or contact the developers."
+                    "attached cfg.background_data via build_background()."
                 )
-
             X_B = np.asarray(background_data, dtype=np.float64)
             if X_B.ndim != 2:
                 raise ValueError(f"Background must be 2D, got {X_B.shape}.")
             if X_B.shape[1] != data.shape[1]:
                 raise ValueError(
-                    f"Background has {X_B.shape[1]} features but target has "
+                    f"Background has {X_B.shape[1]} features but input has "
                     f"{data.shape[1]}. Same embedding model required."
                 )
+
+            # The target subset for Σ_T computation. None means "full input".
+            target_data = getattr(cfg, "target_data", None)
+            if target_data is not None:
+                X_T = np.asarray(target_data, dtype=np.float64)
+                if X_T.ndim != 2 or X_T.shape[1] != data.shape[1]:
+                    raise ValueError(
+                        f"target_data shape {X_T.shape} incompatible with input "
+                        f"({data.shape[0]} rows, {data.shape[1]} features)."
+                    )
+            else:
+                X_T = data
+
             source = getattr(cfg, "background_source", "pool")
-            return data, X_B, None, source 
+            return X_T, X_B, None, source
 
     def get_params(self) -> dict[str, Any]:
         cfg = self.config
@@ -589,7 +608,7 @@ class PPCAReducer(DimensionReducer):
         if n_bg is not None:
             params["n_background_samples"] = int(n_bg)
         return params
-    
+
 
 # =============================================================================
 # k-ρPCA  (kernel-weighted contrastive PCA — Jackson, Carilli & Pachter 2026)
@@ -597,49 +616,13 @@ class PPCAReducer(DimensionReducer):
 # Reference: Jackson, K., Carilli, M., & Pachter, L. (2026).
 #   "The Rayleigh Quotient and Contrastive Principal Component Analysis II."
 #   bioRxiv 2026.04.08.717236. https://github.com/pachterlab/rhopca
-#
-# Objective
-# ---------
-# Given centered target X_T ∈ R^{n_T × d}, background X_B ∈ R^{n_B × d}, and
-# kernel matrix K ∈ R^{n_T × n_T} encoding sample-similarity weights between
-# target samples, k-ρPCA maximises
-#
-#     R(v) = v^T Σ_T^K v / v^T Σ_B v
-#
-# with
-#     Σ_T^K = (1 / (n_T - 1)) X_T^T K X_T   (kernel-weighted target covariance)
-#     Σ_B   = (1 / (n_B - 1)) X_B^T X_B     (standard background covariance)
-#
-# When K = I, k-ρPCA reduces exactly to ρPCA. In paper 2, K typically encodes
-# spatial proximity (Visium spot coordinates). For protein embeddings we
-# expose three kernel sources:
-#
-#   embedding   K_ij = κ(x_i, x_j) — pairwise kernel on standardised target
-#               embeddings. Up-weights neighbours in pLM space → emphasises
-#               local rather than global axes of variation.
-#   similarity  K_ij = κ(d(seq_i, seq_j)) — MMseqs2-derived sequence similarity.
-#               Up-weights homologues. Requires precomputed similarity matrix.
-#   precomputed K is loaded directly from disk.
-#
-# Kernel functions
-# ----------------
-#   gaussian          K_ij = exp(-d_ij^2 / (2 h^2)),  h = sqrt(median(d)) by default
-#   inverse_distance  K_ij = 1 / (d_ij + ε)
-#   linear            K = I (sanity check; reduces k-ρPCA to ρPCA)
 # =============================================================================
 
 
 class KPPCAReducer(PPCAReducer):
-    """k-ρPCA: kernel-weighted contrastive DR.
-
-    Inherits background resolution and the eigenproblem solver from
-    PPCAReducer; overrides only how Σ_T is computed.
-
-    Attributes after fit (in addition to PPCAReducer attrs):
-        kernel_source_       : "embedding" | "similarity" | "precomputed"
-        kernel_              : kernel function name
-        kernel_bandwidth_    : actual bandwidth used (may be auto-resolved)
-        kernel_n_samples_    : n_T (size of K)
+    """k-ρPCA: kernel-weighted contrastive DR. Inherits background resolution
+    and the eigenproblem solver from PPCAReducer; overrides only how Σ_T is
+    computed.
     """
 
     def fit_transform(self, data: np.ndarray) -> np.ndarray:
@@ -674,7 +657,6 @@ class KPPCAReducer(PPCAReducer):
         sigma_target = (X_target_p.T @ K @ X_target_p) / (n_t - 1)
         sigma_target = 0.5 * (sigma_target + sigma_target.T)
 
-        # Σ_B is standard (kernel-weighted background is opt-in and uncommon).
         if cfg.background_kernel:
             logger.warning(
                 "background_kernel=True is unusual for k-ρPCA on protein "
@@ -704,31 +686,31 @@ class KPPCAReducer(PPCAReducer):
         self.kernel_bandwidth_ = kernel_meta["bandwidth"]
         self.kernel_n_samples_ = n_t
 
-        return (X_target_p @ top_eigvecs).astype(np.float64)
+        # Project all input rows so every protein has 2D coordinates.
+        return _project_full_input(
+            data=data,
+            X_target=X_target,
+            top_eigvecs=top_eigvecs,
+            standard_scale=cfg.standard_scale,
+        )
 
 
     def _build_kernel_matrix(
         self, X_target_std: np.ndarray, cfg
     ) -> tuple[np.ndarray, dict]:
-        """Construct the n_T × n_T kernel matrix K.
-
-        Returns (K, metadata_dict). Metadata is recorded in get_params() for
-        diagnostics in run.log.
-        """
+        """Construct the n_T × n_T kernel matrix K."""
         from scipy.spatial.distance import pdist, squareform
 
         source = str(cfg.kernel_source)
         kernel = str(cfg.kernel)
         bandwidth_req = float(cfg.kernel_bandwidth)
 
-        # Linear kernel: K = I, k-ρPCA reduces to ρPCA. Useful as a sanity check.
         if kernel == "linear":
             n_t = X_target_std.shape[0]
             return np.eye(n_t, dtype=np.float64), {
                 "source": source, "kernel": "linear", "bandwidth": float("nan"),
             }
 
-        # Build the pairwise distance vector based on source.
         if source == "embedding":
             distances = pdist(X_target_std, metric="euclidean")
         elif source == "similarity":
@@ -771,12 +753,10 @@ class KPPCAReducer(PPCAReducer):
         else:
             raise ValueError(f"Unknown kernel_source: {source!r}")
 
-        # Resolve bandwidth and apply kernel function.
         if kernel == "gaussian":
             if bandwidth_req > 0.0:
                 bandwidth = bandwidth_req
             else:
-                # rhopca reference heuristic: sqrt(median(distances)).
                 bandwidth = float(np.sqrt(np.median(distances)))
                 if bandwidth <= 0.0:
                     raise ValueError(

@@ -24,17 +24,9 @@ REDUCER_METHODS = [
 # Distance metric types
 METRIC_TYPES = Literal["euclidean", "cosine"]
 
-# ρPCA background construction strategies (paper-grounded; replaces the
-# deprecated auto-split policies random/uniform/outlier which violated the
-# ρPCA premise that Σ_B must estimate a *different* distribution than Σ_T).
-#
-#   pool            — entire external pool (canonical Mode 1, Carilli 2025)
-#   complement      — input \ target, split by annotation column
-#   length_matched  — pool sub-sample with matched length distribution
-#   stratified      — pool sub-sample stratified by annotation columns
-#   mixed           — stratified by annotations AND/OR length bins
+# ρPCA background construction strategies
 BACKGROUND_STRATEGY_TYPES = Literal[
-    "pool", "complement", "length_matched", "stratified", "mixed",
+    "pool", "complement", "length_matched", "stratified", "mixed", "isolate"
 ]
 
 # k-ρPCA kernel sources and kernel functions (paper 2)
@@ -44,14 +36,7 @@ KERNEL_TYPES = Literal["gaussian", "inverse_distance", "linear"]
 
 @dataclass(frozen=True)
 class DimensionReductionConfig:
-    """Configuration for all dimension-reduction methods.
-
-    ρPCA-specific parameters: regularization_mu, background_strategy,
-    standard_scale, samples_per_target, n_length_bins.
-
-    k-ρPCA additionally consumes kernel, kernel_source, kernel_bandwidth,
-    background_kernel.
-    """
+    """Configuration for all dimension-reduction methods."""
 
     n_components: int = field(default=2, metadata={"allowed": [2, 3]})
     n_neighbors: int = field(default=15, metadata={"gt": 0})
