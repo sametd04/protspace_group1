@@ -22,6 +22,8 @@ from protspace.cli.common_options import (
     Opt_NNeighbors,
     Opt_Perplexity,
     Opt_PpcaBackground,
+    Opt_PpcaMode,
+    PpcaMode,
     Opt_RandomState,
     Opt_RegularizationMu,
     Opt_Similarity,
@@ -64,6 +66,7 @@ def project(
     max_iter: Opt_MaxIter = 300,
     eps: Opt_Eps = 1e-3,
     regularization_mu: Opt_RegularizationMu = 1e-3,
+    ppca_mode: Opt_PpcaMode = PpcaMode.explicit,
     ppca_background: Opt_PpcaBackground = None,
     standard_scale: Opt_StandardScale = True,
     verbose: Opt_Verbose = 0,
@@ -135,6 +138,7 @@ def project(
         eps=eps,
         regularization_mu=regularization_mu,
         standard_scale=standard_scale,
+        ppca_mode=ppca_mode.value,
         background_path=bg_path_str,
     )
     global_params = asdict(reducer_params)
@@ -161,12 +165,20 @@ def project(
             if emb_set.precomputed:
                 effective_params["precomputed"] = True
 
-            # ρPCA: explicit external background only.
+            # ρPCA in `project` supports explicit backgrounds only because this
+            # command has no annotation table or FASTA-derived sequence context.
+            # Use `prepare` for --ppca-mode=annotation or --ppca-mode=derived.
             if method == PPCA_NAME:
+                mode = str(effective_params.get("ppca_mode", "explicit"))
+                if mode != "explicit":
+                    raise typer.BadParameter(
+                        "protspace project supports only --ppca-mode=explicit. "
+                        "Use protspace prepare for annotation-driven or derived "
+                        "nuisance-only ρPCA backgrounds."
+                    )
                 if bg_data is None:
                     raise typer.BadParameter(
-                        "ppca requires --ppca-background <background.h5>. "
-                        "The old automatic background strategies have been removed."
+                        "ppca explicit mode requires --ppca-background <background.h5>."
                     )
                 if bg_data.shape[1] != emb_set.data.shape[1]:
                     raise typer.BadParameter(
@@ -175,10 +187,10 @@ def project(
                         "Use the same embedding model for target and background."
                     )
                 effective_params["background_data"] = bg_data
-                effective_params["background_source"] = "external"
+                effective_params["background_source"] = "explicit"
                 effective_params["background_n_samples"] = int(bg_data.shape[0])
                 effective_params["background_details"] = {
-                    "mode": "external",
+                    "mode": "explicit",
                     "path": bg_path_str,
                     "n_background": int(bg_data.shape[0]),
                     "n_target": int(emb_set.data.shape[0]),

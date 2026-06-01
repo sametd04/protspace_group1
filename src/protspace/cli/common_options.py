@@ -13,6 +13,20 @@ class Metric(str, Enum):
     manhattan = "manhattan"
 
 
+class PpcaMode(str, Enum):
+    """User-facing ρPCA background modes.
+
+    explicit   : use an external HDF5 embedding set as Σ_B input.
+    annotation : select background rows from the current dataset by annotation.
+    derived    : build nuisance-only sequences from the current dataset and
+                 embed them as the background.
+    """
+
+    explicit = "explicit"
+    annotation = "annotation"
+    derived = "derived"
+
+
 Opt_Verbose = Annotated[
     int,
     typer.Option("-v", "--verbose", count=True, help="Verbosity: -v=INFO, -vv=DEBUG."),
@@ -107,14 +121,125 @@ Opt_RegularizationMu = Annotated[
         min=0.0,
     ),
 ]
+Opt_PpcaMode = Annotated[
+    PpcaMode,
+    typer.Option(
+        "--ppca-mode",
+        help=(
+            "ρPCA background mode: explicit=external HDF5 background; "
+            "annotation=select background rows from current dataset by annotation; "
+            "derived=embed nuisance-only sequence segments from the current dataset."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
 Opt_PpcaBackground = Annotated[
     Path | None,
     typer.Option(
         "--ppca-background",
         help=(
-            "Path to an HDF5 file holding explicit background embeddings for ρPCA. "
-            "Identifiers are not required to overlap with the target, but the "
-            "embedding dimensionality must match."
+            "Explicit ρPCA background HDF5 file. Required for --ppca-mode=explicit. "
+            "Identifiers do not need to overlap with the target, but embedding "
+            "dimensionality must match."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaBackgroundAnnotation = Annotated[
+    str | None,
+    typer.Option(
+        "--ppca-background-annotation",
+        help=(
+            "Annotation column used by --ppca-mode=annotation to select background "
+            "rows, and optionally by --ppca-mode=derived to choose which rows receive "
+            "derived nuisance-only segments."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaBackgroundValues = Annotated[
+    str | None,
+    typer.Option(
+        "--ppca-background-values",
+        help=(
+            "Comma-separated values in --ppca-background-annotation that define the "
+            "background. If omitted, non-empty/non-missing/truthy values are selected."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaDerivedSegmentColumn = Annotated[
+    str | None,
+    typer.Option(
+        "--ppca-derived-segment-column",
+        help=(
+            "For --ppca-mode=derived: annotation column containing the exact nuisance "
+            "sequence to embed as background, e.g. signal_peptide_sequence. This is "
+            "preferred when available."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaDerivedStartColumn = Annotated[
+    str | None,
+    typer.Option(
+        "--ppca-derived-start-column",
+        help=(
+            "For --ppca-mode=derived: annotation column with 0-based inclusive segment "
+            "start. If omitted, --ppca-derived-fixed-start is used."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaDerivedEndColumn = Annotated[
+    str | None,
+    typer.Option(
+        "--ppca-derived-end-column",
+        help=(
+            "For --ppca-mode=derived: annotation column with 0-based exclusive segment "
+            "end, e.g. SignalP cleavage position converted to Python slicing coordinates."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaDerivedFixedStart = Annotated[
+    int,
+    typer.Option(
+        "--ppca-derived-fixed-start",
+        help="For --ppca-mode=derived: fallback 0-based inclusive segment start.",
+        rich_help_panel="Projection",
+        min=0,
+    ),
+]
+Opt_PpcaDerivedFixedEnd = Annotated[
+    int,
+    typer.Option(
+        "--ppca-derived-fixed-end",
+        help=(
+            "For --ppca-mode=derived: fallback 0-based exclusive segment end. "
+            "Use 0 to require --ppca-derived-end-column or --ppca-derived-segment-column."
+        ),
+        rich_help_panel="Projection",
+        min=0,
+    ),
+]
+Opt_PpcaDerivedMinLength = Annotated[
+    int,
+    typer.Option(
+        "--ppca-derived-min-length",
+        help="For --ppca-mode=derived: discard derived segments shorter than this length.",
+        rich_help_panel="Projection",
+        min=1,
+    ),
+]
+Opt_PpcaDerivedEmbedder = Annotated[
+    str | None,
+    typer.Option(
+        "--ppca-derived-embedder",
+        help=(
+            "For --ppca-mode=derived: embedding model used for nuisance-only segments. "
+            "Defaults to the current embedding set name, so HDF5 inputs should be named "
+            "after their model, e.g. -i prot_t5.h5:prot_t5."
         ),
         rich_help_panel="Projection",
     ),
@@ -136,7 +261,7 @@ Opt_Fasta = Annotated[
     typer.Option(
         "-f",
         "--fasta",
-        help="FASTA for -s/--similarity when input is HDF5.",
+        help="FASTA for -s/--similarity when input is HDF5; also supplies sequences for --ppca-mode=derived.",
         rich_help_panel="Input",
     ),
 ]

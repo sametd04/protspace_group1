@@ -33,6 +33,17 @@ from protspace.cli.common_options import (
     Opt_NNeighbors,
     Opt_Perplexity,
     Opt_PpcaBackground,
+    Opt_PpcaBackgroundAnnotation,
+    Opt_PpcaBackgroundValues,
+    Opt_PpcaDerivedEmbedder,
+    Opt_PpcaDerivedEndColumn,
+    Opt_PpcaDerivedFixedEnd,
+    Opt_PpcaDerivedFixedStart,
+    Opt_PpcaDerivedMinLength,
+    Opt_PpcaDerivedSegmentColumn,
+    Opt_PpcaDerivedStartColumn,
+    Opt_PpcaMode,
+    PpcaMode,
     Opt_RandomState,
     Opt_RegularizationMu,
     Opt_Similarity,
@@ -239,6 +250,12 @@ def _embed_all(
 
 
 
+def _parse_csv(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return tuple(v.strip() for v in value.split(",") if v.strip())
+
+
 @app.command()
 def prepare(
     input: Opt_Input = None,
@@ -260,7 +277,17 @@ def prepare(
     max_iter: Opt_MaxIter = 300,
     eps: Opt_Eps = 1e-3,
     regularization_mu: Opt_RegularizationMu = 1e-3,
+    ppca_mode: Opt_PpcaMode = PpcaMode.explicit,
     ppca_background: Opt_PpcaBackground = None,
+    ppca_background_annotation: Opt_PpcaBackgroundAnnotation = None,
+    ppca_background_values: Opt_PpcaBackgroundValues = None,
+    ppca_derived_segment_column: Opt_PpcaDerivedSegmentColumn = None,
+    ppca_derived_start_column: Opt_PpcaDerivedStartColumn = None,
+    ppca_derived_end_column: Opt_PpcaDerivedEndColumn = None,
+    ppca_derived_fixed_start: Opt_PpcaDerivedFixedStart = 0,
+    ppca_derived_fixed_end: Opt_PpcaDerivedFixedEnd = 0,
+    ppca_derived_min_length: Opt_PpcaDerivedMinLength = 5,
+    ppca_derived_embedder: Opt_PpcaDerivedEmbedder = None,
     standard_scale: Opt_StandardScale = True,
     annotations: Opt_Annotations = None,
     scores: Opt_Scores = True,
@@ -465,7 +492,17 @@ def prepare(
             eps=eps,
             regularization_mu=regularization_mu,
             standard_scale=standard_scale,
+            ppca_mode=ppca_mode.value,
             background_path=str(ppca_background) if ppca_background else "",
+            background_annotation=ppca_background_annotation or "",
+            background_values=_parse_csv(ppca_background_values),
+            derived_segment_column=ppca_derived_segment_column or "",
+            derived_start_column=ppca_derived_start_column or "",
+            derived_end_column=ppca_derived_end_column or "",
+            derived_fixed_start=ppca_derived_fixed_start,
+            derived_fixed_end=ppca_derived_fixed_end,
+            derived_min_length=ppca_derived_min_length,
+            derived_embedder=ppca_derived_embedder or "",
         )
         config = PipelineConfig(
             methods=method_specs,
