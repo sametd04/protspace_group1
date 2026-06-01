@@ -46,15 +46,8 @@ class ReducerParams:
     max_iter: int = 300
     eps: float = 1e-6
     regularization_mu: float = 1e-3
-    background_strategy: str = "pool"
     standard_scale: bool = True
     background_path: str = ""
-    target_annotation: str = ""
-    target_values: tuple[str, ...] = ()
-    stratify_by: tuple[str, ...] = ()
-    match_length: bool = False
-    samples_per_target: int = 3
-    n_length_bins: int = 10
 
 @dataclass(frozen=True)
 class MethodSpec:
@@ -149,38 +142,37 @@ def _run_with_overridden_config(base: BaseProcessor, effective_params: dict[str,
 
 def _load_background_h5(path: Path) -> tuple[np.ndarray, list[str]]:
     from protspace.data.loaders import load_h5
-    # Provide name_override to bypass the missing 'model_name' attribute check
+
+    # Provide name_override to bypass the missing 'model_name' attribute check.
     emb_set = load_h5([path], name_override="background")
     arr = np.asarray(emb_set.data, dtype=np.float64)
     headers = list(emb_set.headers)
-    logger.info("Loaded ρPCA pool: %d × %d from %s", *arr.shape, path)
+    logger.info("Loaded explicit ρPCA background: %d × %d from %s", *arr.shape, path)
     return arr, headers
 
-def _lengths_from_fasta(path: Path, headers: list[str]) -> np.ndarray:
-    from protspace.data.io.fasta import parse_fasta
-    from protspace.data.loaders.h5 import parse_identifier
-    raw = parse_fasta(Path(path))
-    by_id = {parse_identifier(h): len(s) for h, s in raw.items()}
-    return np.array([by_id.get(h, 0) for h in headers], dtype=int)
 
-def _lengths_from_annotations(annot: pd.DataFrame, headers: list[str], column: str = "sequence_length") -> np.ndarray | None:
-    if column not in annot.columns: return None
-    by_id = dict(zip(annot["identifier"], annot[column]))
-    try:
-        return np.array([int(by_id.get(h, 0)) for h in headers], dtype=int)
-    except (TypeError, ValueError):
-        return None
+def _file_fingerprint(path: Path) -> dict[str, str | int]:
+    """Return a lightweight cache fingerprint for a file-backed input.
+
+    This prevents stale cached projections when a background file is changed
+    in place but retains the same path.
+    """
+    resolved = path.expanduser().resolve()
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
 
 class ReductionPipeline:
     def __init__(self, config: PipelineConfig):
         self.config = config
         reducer_dict = asdict(config.reducer_params)
         self.base = BaseProcessor(reducer_dict, get_reducers())
-        self._background_cache: dict[
-            str, tuple[np.ndarray, list[str], pd.DataFrame, np.ndarray | None]
-        ] = {}
+        self._background_cache: dict[str, tuple[np.ndarray, list[str]]] = {}
         self._similarity_matrix_cache: np.ndarray | None = None
-        self._sequence_lengths: dict[str, np.ndarray] = {}
 
     def run(self, embedding_sets: list[EmbeddingSet]) -> Path:
         if not embedding_sets: raise ValueError("At least one EmbeddingSet is required.")
@@ -204,14 +196,6 @@ class ReductionPipeline:
             )
         metadata = full_metadata
 
-        for emb_set in embedding_sets:
-            lengths = None
-            if emb_set.fasta_path and Path(emb_set.fasta_path).exists():
-                lengths = _lengths_from_fasta(emb_set.fasta_path, emb_set.headers)
-            if lengths is None:
-                lengths = _lengths_from_annotations(metadata, emb_set.headers)
-            if lengths is not None:
-                self._sequence_lengths[emb_set.name] = lengths
 
         all_reductions = self._run_reductions(embedding_sets, metadata)
 
@@ -387,88 +371,16 @@ class ReductionPipeline:
         if path is None: return
         np.savez(path, data=reduction["data"], info=np.array(json.dumps(reduction["info"])))
 
-    def _get_background_pool(
-        self, background_path: str
-    ) -> tuple[np.ndarray, list[str], pd.DataFrame, np.ndarray | None]:
+    def _get_explicit_background(self, background_path: str) -> tuple[np.ndarray, list[str]]:
         if not background_path:
-            raise ValueError("Missing ρPCA background_path.")
+            raise ValueError(
+                "ρPCA requires --ppca-background <background.h5>. "
+                "The old automatic background strategies have been removed; "
+                "this version supports only explicit external backgrounds."
+            )
         if background_path not in self._background_cache:
-            arr, headers = _load_background_h5(Path(background_path))
-            pool_annot = self._fetch_annotations(headers)
-            pool_lengths = _lengths_from_annotations(pool_annot, headers)
-            self._background_cache[background_path] = (
-                arr, headers, pool_annot, pool_lengths
-            )
+            self._background_cache[background_path] = _load_background_h5(Path(background_path))
         return self._background_cache[background_path]
-
-    def _build_ppca_background(
-        self,
-        target_embeddings: np.ndarray,
-        target_headers: list[str],
-        target_annotations: pd.DataFrame,
-        target_lengths: np.ndarray | None,
-        rng: np.random.Generator,
-        effective_params: dict[str, Any],
-    ):
-        from types import SimpleNamespace
-
-        from protspace.data.processors.background_strategies import (
-            build_background,
-            POOL,
-            COMPLEMENT,
-            LENGTH_MATCHED,
-            STRATIFIED,
-            MIXED,
-            ISOLATE,
-        )
-
-        # Use method-specific overrides when constructing the background.
-        # Previously this read self.config.reducer_params directly, so inline
-        # overrides such as -m 'ppca2:samples_per_target=5' were ignored.
-        rp = SimpleNamespace(**{**asdict(self.config.reducer_params), **effective_params})
-        strategy = rp.background_strategy
-
-        if strategy == COMPLEMENT:
-            pool_emb = target_embeddings
-            pool_headers = target_headers
-            pool_annot = target_annotations
-            pool_lengths = target_lengths
-        else:
-            if not rp.background_path:
-                raise ValueError(f"ρPCA strategy '{strategy}' requires an external pool (e.g. SwissProt). Pass --ppca-background <pool.h5>.")
-            pool_emb, pool_headers, pool_annot, pool_lengths = self._get_background_pool(
-                rp.background_path
-            )
-
-        kwargs = dict(
-            pool_embeddings=pool_emb, pool_headers=pool_headers, pool_annotations=pool_annot,
-            target_embeddings=target_embeddings, target_headers=target_headers, target_annotations=target_annotations,
-            rng=rng, samples_per_target=rp.samples_per_target, n_length_bins=rp.n_length_bins,
-        )
-
-        if strategy == COMPLEMENT:
-            if not rp.target_annotation or not rp.target_values:
-                raise ValueError("Strategy 'complement' requires --ppca-target-annotation and --ppca-target-values.")
-            kwargs["target_annotation"] = rp.target_annotation
-            kwargs["target_values"] = list(rp.target_values)
-
-        elif strategy == LENGTH_MATCHED:
-            kwargs["pool_lengths"] = pool_lengths
-            kwargs["target_lengths"] = target_lengths
-
-        elif strategy == STRATIFIED or strategy == ISOLATE:
-            if not rp.stratify_by:
-                raise ValueError(f"Strategy '{strategy}' requires --ppca-stratify-by.")
-            kwargs["stratify_by"] = list(rp.stratify_by)
-
-        elif strategy == MIXED:
-            kwargs["stratify_by"] = list(rp.stratify_by)
-            kwargs["match_length"] = rp.match_length
-            if rp.match_length:
-                kwargs["pool_lengths"] = pool_lengths
-                kwargs["target_lengths"] = target_lengths
-
-        return build_background(strategy, **kwargs)
 
     def _run_reductions(self, embedding_sets: list[EmbeddingSet], annotations_df: pd.DataFrame) -> list[dict[str, Any]]:
         all_reductions = []
@@ -500,19 +412,26 @@ class ReductionPipeline:
                 effective_params = {**global_params, **spec.overrides_dict}
 
                 if method == PPCA_NAME:
-                    spec_bg = self._build_ppca_background(
-                        target_embeddings=emb_set.data, target_headers=emb_set.headers,
-                        target_annotations=annotations_df, target_lengths=self._sequence_lengths.get(emb_set.name),
-                        rng=np.random.default_rng(effective_params["random_state"]),
-                        effective_params=effective_params,
-                    )
-                    effective_params["background_data"] = spec_bg.X_background
-                    effective_params["background_source"] = spec_bg.source
-                    effective_params["background_n_samples"] = spec_bg.n_background
-                    effective_params["background_details"] = spec_bg.details
-
-                    if spec_bg.X_target is not None:
-                        effective_params["target_data"] = spec_bg.X_target
+                    background_path = str(effective_params.get("background_path", ""))
+                    background_data, background_headers = self._get_explicit_background(background_path)
+                    if background_data.shape[1] != emb_set.data.shape[1]:
+                        raise ValueError(
+                            f"ρPCA background '{background_path}' has "
+                            f"{background_data.shape[1]} features, but target "
+                            f"embedding '{emb_set.name}' has {emb_set.data.shape[1]}. "
+                            "Use the same embedding model for target and background."
+                        )
+                    effective_params["background_data"] = background_data
+                    effective_params["background_source"] = "external"
+                    effective_params["background_n_samples"] = int(background_data.shape[0])
+                    effective_params["background_details"] = {
+                        "mode": "external",
+                        "path": background_path,
+                        "n_background": int(background_data.shape[0]),
+                        "n_target": int(emb_set.data.shape[0]),
+                        "n_background_headers": len(background_headers),
+                    }
+                    effective_params["background_fingerprint"] = _file_fingerprint(Path(background_path))
 
                 param_suffix = disambiguation_suffix(spec, method_counts)
                 cached = self._load_cached_projection(emb_set.name, method, dims, effective_params, param_suffix)

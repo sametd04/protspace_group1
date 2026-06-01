@@ -28,15 +28,17 @@ REDUCER_METHODS = [
 # Distance metric types
 METRIC_TYPES = Literal["euclidean", "cosine"]
 
-# ρPCA background construction strategies
-BACKGROUND_STRATEGY_TYPES = Literal[
-    "pool", "complement", "length_matched", "stratified", "mixed", "isolate"
-]
-
 
 @dataclass(frozen=True)
 class DimensionReductionConfig:
-    """Configuration for all dimension-reduction methods."""
+    """Configuration for all dimension-reduction methods.
+
+    ρPCA intentionally has no in-reducer background selection strategy.
+    The pipeline must attach a prepared ``background_data`` ndarray as a
+    side channel before constructing ``PPCAReducer``. This keeps the reducer
+    mathematically pure: it only solves the Rayleigh quotient eigenproblem
+    for an already-defined target/background pair.
+    """
 
     n_components: int = field(default=2, metadata={"allowed": [2, 3]})
     n_neighbors: int = field(default=15, metadata={"gt": 0})
@@ -56,13 +58,7 @@ class DimensionReductionConfig:
 
     # ρPCA parameters
     regularization_mu: float = field(default=1e-3, metadata={"gte": 0})
-    background_strategy: BACKGROUND_STRATEGY_TYPES = field(
-        default="pool",
-        metadata={"allowed": list(get_args(BACKGROUND_STRATEGY_TYPES))},
-    )
     standard_scale: bool = field(default=True)
-    samples_per_target: int = field(default=3, metadata={"gt": 0})
-    n_length_bins: int = field(default=10, metadata={"gt": 0})
 
     def __post_init__(self):
         for f in fields(self):

@@ -458,11 +458,11 @@ def _project_full_input(
     coordinate frame.
 
     The pipeline always passes the full input as `data` (one row per protein
-    for visualisation). When the strategy partitions the input — e.g.
-    'complement' — the target subset `X_target` is used to compute Σ_T and
-    define the standardisation. Background-subset and external pool rows
-    are projected through the same standardisation so the resulting plot
-    uses one consistent coordinate system.
+    for visualisation). If the pipeline provides a distinct target subset
+    through `cfg.target_data`, that subset defines the target mean/std and
+    Σ_T. All displayed proteins are projected through the same target-space
+    standardisation so the resulting plot uses one consistent coordinate
+    system.
     """
     target_mean = X_target.mean(axis=0, keepdims=True)
     if standard_scale:
@@ -479,9 +479,10 @@ class PPCAReducer(DimensionReducer):
     """ρPCA: contrastive dimension reduction via generalized eigendecomposition.
 
     Solves Σ_T v = λ Σ_B v for the top n_components eigenvectors. The
-    target matrix used to compute Σ_T may be a strategy-selected subset of
-    the input; the projection step always covers the FULL input so every
-    protein has visualisation coordinates.
+    target matrix used to compute Σ_T may be supplied by the pipeline as
+    ``cfg.target_data``; otherwise the full input is the target. The projection
+    step always covers the FULL input so every protein has visualisation
+    coordinates.
 
     See Carilli, Jackson & Pachter 2025 (bioRxiv 2025.11.19.689125) for the
     objective; matches the rhopca reference implementation
@@ -509,7 +510,7 @@ class PPCAReducer(DimensionReducer):
                 f"n_components={cfg.n_components} > n_features={n_features}."
             )
 
-        X_target, X_background, bg_idx, bg_source = self._resolve_target_background(
+        X_target, X_background, _, bg_source = self._resolve_target_background(
             data, cfg
         )
 
@@ -569,8 +570,8 @@ class PPCAReducer(DimensionReducer):
 
             `data` is always the FULL input from the pipeline (one row per
             protein for visualisation). The target subset for computing Σ_T
-            may differ — if cfg.target_data is set, it holds the strategy-
-            selected target subset; otherwise the full `data` IS the target.
+            may differ — if cfg.target_data is set, it holds a pipeline-
+            prepared target subset; otherwise the full `data` is the target.
             """
             background_data = getattr(cfg, "background_data", None)
             if background_data is None:
@@ -599,7 +600,7 @@ class PPCAReducer(DimensionReducer):
             else:
                 X_T = data
 
-            source = getattr(cfg, "background_source", "pool")
+            source = getattr(cfg, "background_source", "external")
             return X_T, X_B, None, source
 
     def get_params(self) -> dict[str, Any]:
@@ -607,7 +608,6 @@ class PPCAReducer(DimensionReducer):
         params = {
             "n_components": int(cfg.n_components),
             "random_state": int(cfg.random_state),
-            "background_strategy": str(cfg.background_strategy),
             "regularization_mu": float(cfg.regularization_mu),
             "standard_scale": bool(cfg.standard_scale),
         }

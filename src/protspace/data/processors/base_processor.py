@@ -43,10 +43,7 @@ class BaseProcessor:
             "eps",
             "random_state",
             "regularization_mu",
-            "background_strategy",
             "standard_scale",
-            "samples_per_target",
-            "n_length_bins",
         }
         filtered_config = {
             k: v for k, v in self.config.items() if k in valid_config_keys
