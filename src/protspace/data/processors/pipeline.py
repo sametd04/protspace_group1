@@ -69,6 +69,13 @@ class ReducerParams:
     derived_min_length: int = 5
     derived_embedder: str = ""
 
+    # Paired-delta background parameters. The background rows are signed
+    # deviations ±scale·(full_embedding - mature_embedding). This captures
+    # both common and heterogeneous full-vs-mature embedding shifts.
+    paired_full_path: str = ""
+    paired_mature_path: str = ""
+    paired_delta_scale: float = 0.5
+
 
 @dataclass(frozen=True)
 class MethodSpec:
@@ -256,6 +263,7 @@ class ReductionPipeline:
         self.base = BaseProcessor(reducer_dict, get_reducers())
         self._background_cache: dict[str, tuple[np.ndarray, list[str]]] = {}
         self._derived_background_cache: dict[str, tuple[np.ndarray, list[str], dict[str, Any]]] = {}
+        self._paired_delta_background_cache: dict[str, tuple[np.ndarray, list[str], dict[str, Any]]] = {}
         self._similarity_matrix_cache: np.ndarray | None = None
         self._sequences: dict[str, str] = {}
 
@@ -804,6 +812,146 @@ class ReductionPipeline:
         self._derived_background_cache[cache_key] = result
         return result
 
+
+    def _build_paired_delta_background(
+        self,
+        emb_set: EmbeddingSet,
+        annotations_df: pd.DataFrame,
+        params: dict[str, Any],
+    ) -> tuple[np.ndarray, list[str], dict[str, Any]]:
+        """Build a signed paired-delta background for ρPCA.
+
+        For each selected protein with both embeddings available, compute
+
+            delta_i = E(full_i) - E(mature_i)
+
+        and create two background rows
+
+            +scale * delta_i,  -scale * delta_i.
+
+        The signed construction is important: ordinary covariance centers the
+        background. If all signal peptides shift embeddings in nearly the same
+        direction, using raw deltas alone can center away that common shift.
+        Signed deltas keep the common full-vs-mature shift in the covariance
+        through delta_i delta_i^T.
+        """
+        full_path = str(params.get("paired_full_path", ""))
+        mature_path = str(params.get("paired_mature_path", ""))
+        if not full_path or not mature_path:
+            raise ValueError(
+                "ρPCA paired_delta mode requires --ppca-paired-full <full.h5> "
+                "and --ppca-paired-mature <mature.h5>."
+            )
+
+        scale = float(params.get("paired_delta_scale", 0.5))
+        if scale <= 0.0:
+            raise ValueError("--ppca-paired-delta-scale must be > 0 for paired_delta mode.")
+
+        cache_payload = {
+            "mode": "paired_delta",
+            "full": _file_fingerprint(Path(full_path)),
+            "mature": _file_fingerprint(Path(mature_path)),
+            "scale": scale,
+            "selector_column": str(params.get("background_annotation", "")),
+            "selector_values": list(tuple(params.get("background_values", ()) or ())),
+            "target_headers_hash": hashlib.sha256(
+                json.dumps(list(emb_set.headers), sort_keys=False).encode()
+            ).hexdigest()[:16],
+        }
+        cache_key = hashlib.sha256(
+            json.dumps(cache_payload, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
+        if cache_key in self._paired_delta_background_cache:
+            return self._paired_delta_background_cache[cache_key]
+
+        full_data, full_headers = self._get_explicit_background(full_path)
+        mature_data, mature_headers = self._get_explicit_background(mature_path)
+
+        if full_data.shape[1] != emb_set.data.shape[1]:
+            raise ValueError(
+                f"Paired full embeddings have {full_data.shape[1]} features, but "
+                f"target embedding '{emb_set.name}' has {emb_set.data.shape[1]}. "
+                "Use the same embedding model for target, full, and mature inputs."
+            )
+        if mature_data.shape[1] != emb_set.data.shape[1]:
+            raise ValueError(
+                f"Paired mature embeddings have {mature_data.shape[1]} features, but "
+                f"target embedding '{emb_set.name}' has {emb_set.data.shape[1]}. "
+                "Use the same embedding model for target, full, and mature inputs."
+            )
+
+        full_index = {h: i for i, h in enumerate(full_headers)}
+        mature_index = {h: i for i, h in enumerate(mature_headers)}
+
+        selector_details: dict[str, Any] | None = None
+        candidate_mask = np.ones(len(emb_set.headers), dtype=bool)
+        if str(params.get("background_annotation", "")):
+            candidate_mask, selector_details = self._annotation_mask(
+                list(emb_set.headers),
+                annotations_df,
+                str(params.get("background_annotation", "")),
+                tuple(params.get("background_values", ()) or ()),
+            )
+
+        selected_headers: list[str] = []
+        missing_full = 0
+        missing_mature = 0
+        for i, header in enumerate(emb_set.headers):
+            if not candidate_mask[i]:
+                continue
+            has_full = header in full_index
+            has_mature = header in mature_index
+            if has_full and has_mature:
+                selected_headers.append(header)
+            else:
+                if not has_full:
+                    missing_full += 1
+                if not has_mature:
+                    missing_mature += 1
+
+        if len(selected_headers) < 2:
+            raise ValueError(
+                f"ρPCA paired_delta mode found only {len(selected_headers)} usable "
+                "full/mature pair(s); need at least 2. Check paired HDF5 identifiers "
+                "and the optional --ppca-background-annotation selector."
+            )
+
+        deltas = np.vstack([
+            full_data[full_index[h]] - mature_data[mature_index[h]]
+            for h in selected_headers
+        ]).astype(np.float64)
+
+        # Signed rows preserve the common shift direction under covariance
+        # centering. We explicitly recenter to remove tiny floating-point drift.
+        X_B = np.vstack([scale * deltas, -scale * deltas]).astype(np.float64)
+        X_B = X_B - X_B.mean(axis=0, keepdims=True)
+        background_headers = (
+            [f"{_safe_identifier(h)}__paired_delta_pos" for h in selected_headers]
+            + [f"{_safe_identifier(h)}__paired_delta_neg" for h in selected_headers]
+        )
+
+        details = {
+            "mode": "paired_delta",
+            "selector": selector_details,
+            "full_path": full_path,
+            "mature_path": mature_path,
+            "delta_scale": scale,
+            "n_pairs": len(selected_headers),
+            "n_background": int(X_B.shape[0]),
+            "n_target": int(emb_set.data.shape[0]),
+            "missing_full": missing_full,
+            "missing_mature": missing_mature,
+            "cache_key": cache_key,
+            "note": (
+                "Background rows are signed paired deltas: ±scale·(E(full)-E(mature)). "
+                "This models the signal-peptide-induced embedding shift while "
+                "controlling for each protein's mature-domain biology."
+            ),
+        }
+        result = (X_B, background_headers, details)
+        self._paired_delta_background_cache[cache_key] = result
+        return result
+
     def _prepare_ppca_inputs(
         self,
         emb_set: EmbeddingSet,
@@ -811,9 +959,9 @@ class ReductionPipeline:
         effective_params: dict[str, Any],
     ) -> None:
         mode = str(effective_params.get("ppca_mode", "explicit"))
-        if mode not in {"explicit", "annotation", "derived"}:
+        if mode not in {"explicit", "annotation", "derived", "paired_delta"}:
             raise ValueError(
-                f"Unknown ppca_mode={mode!r}. Expected explicit, annotation, or derived."
+                f"Unknown ppca_mode={mode!r}. Expected explicit, annotation, derived, or paired_delta."
             )
 
         if mode == "explicit":
@@ -858,6 +1006,27 @@ class ReductionPipeline:
                         index=True,
                     ).values.tobytes()
                 ).hexdigest()[:16],
+            }
+            return
+
+        if mode == "paired_delta":
+            background_data, background_headers, details = self._build_paired_delta_background(
+                emb_set, annotations_df, effective_params
+            )
+            effective_params["background_data"] = background_data
+            effective_params["background_source"] = "paired_delta"
+            effective_params["background_n_samples"] = int(background_data.shape[0])
+            effective_params["background_details"] = details
+            effective_params["background_fingerprint"] = {
+                "mode": "paired_delta",
+                "embedding": emb_set.name,
+                "cache_key": details.get("cache_key"),
+                "n_pairs": details.get("n_pairs"),
+                "n_background": int(background_data.shape[0]),
+                "n_background_headers": len(background_headers),
+                "full_path": details.get("full_path"),
+                "mature_path": details.get("mature_path"),
+                "delta_scale": details.get("delta_scale"),
             }
             return
 

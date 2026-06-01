@@ -16,15 +16,19 @@ class Metric(str, Enum):
 class PpcaMode(str, Enum):
     """User-facing ρPCA background modes.
 
-    explicit   : use an external HDF5 embedding set as Σ_B input.
-    annotation : select background rows from the current dataset by annotation.
-    derived    : build nuisance-only sequences from the current dataset and
-                 embed them as the background.
+    explicit     : use an external HDF5 embedding set as Σ_B input.
+    annotation   : select background rows from the current dataset by annotation.
+    derived      : build nuisance-only sequences from the current dataset and
+                   embed them as the background.
+    paired_delta : build a signed paired-delta background from paired full and
+                   mature embedding files. This is the recommended mode for
+                   suppressing signal-peptide artifacts in 3FTx.
     """
 
     explicit = "explicit"
     annotation = "annotation"
     derived = "derived"
+    paired_delta = "paired_delta"
 
 
 Opt_Verbose = Annotated[
@@ -128,7 +132,8 @@ Opt_PpcaMode = Annotated[
         help=(
             "ρPCA background mode: explicit=external HDF5 background; "
             "annotation=select background rows from current dataset by annotation; "
-            "derived=embed nuisance-only sequence segments from the current dataset."
+            "derived=embed nuisance-only sequence segments from the current dataset; "
+            "paired_delta=signed paired full-minus-mature embedding deltas."
         ),
         rich_help_panel="Projection",
     ),
@@ -244,6 +249,43 @@ Opt_PpcaDerivedEmbedder = Annotated[
         rich_help_panel="Projection",
     ),
 ]
+
+Opt_PpcaPairedFull = Annotated[
+    Path | None,
+    typer.Option(
+        "--ppca-paired-full",
+        help=(
+            "For --ppca-mode=paired_delta: HDF5 embeddings generated from full "
+            "precursor sequences for rows that have both full and mature forms."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaPairedMature = Annotated[
+    Path | None,
+    typer.Option(
+        "--ppca-paired-mature",
+        help=(
+            "For --ppca-mode=paired_delta: HDF5 embeddings generated from mature "
+            "sequences, using identifiers that overlap the full-embedding file."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaPairedDeltaScale = Annotated[
+    float,
+    typer.Option(
+        "--ppca-paired-delta-scale",
+        help=(
+            "For --ppca-mode=paired_delta: scale applied to each signed delta row. "
+            "Use 0.5 for pair-mean deviations ±(full-mature)/2; use 1.0 for a "
+            "stronger nuisance covariance if regularization dominates."
+        ),
+        rich_help_panel="Projection",
+        min=0.0,
+    ),
+]
+
 Opt_StandardScale = Annotated[
     bool,
     typer.Option(
