@@ -12,16 +12,6 @@ class Metric(str, Enum):
     cosine = "cosine"
     manhattan = "manhattan"
 
-class Kernel(str, Enum):
-    gaussian = "gaussian"
-    inverse_distance = "inverse_distance"
-    linear = "linear"
-
-class KernelSource(str, Enum):
-    embedding = "embedding"
-    similarity = "similarity"
-    precomputed = "precomputed"
-
 class PpcaStrategy(str, Enum):
     pool = "pool"
     complement = "complement"
@@ -117,11 +107,6 @@ Opt_StandardScale = Annotated[
         rich_help_panel="Projection",
     ),
 ]
-Opt_KppcaKernel = Annotated[Kernel, typer.Option("--kppca-kernel", help="k-ρPCA kernel function.", rich_help_panel="Projection")]
-Opt_KppcaKernelSource = Annotated[KernelSource, typer.Option("--kppca-kernel-source", help="Source of pairwise distances.", rich_help_panel="Projection")]
-Opt_KppcaKernelBandwidth = Annotated[float, typer.Option("--kppca-kernel-bandwidth", help="k-ρPCA Gaussian kernel bandwidth h.", rich_help_panel="Projection", min=0.0)]
-Opt_KppcaKernelPath = Annotated[Path | None, typer.Option("--kppca-kernel-path", help="Path to precomputed kernel matrix.", rich_help_panel="Projection")]
-Opt_KppcaBackgroundKernel = Annotated[bool, typer.Option("--kppca-background-kernel/--no-kppca-background-kernel", help="Apply kernel to background.", rich_help_panel="Projection")]
 Opt_PpcaStrategy = Annotated[
     PpcaStrategy,
     typer.Option(

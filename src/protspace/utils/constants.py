@@ -14,11 +14,15 @@ PACMAP_NAME = "pacmap"
 MDS_NAME = "mds"
 LOCALMAP_NAME = "localmap"
 PPCA_NAME = "ppca"
-KPPCA_NAME = "kppca"
 
 REDUCER_METHODS = [
-    PCA_NAME, TSNE_NAME, UMAP_NAME, PACMAP_NAME,
-    MDS_NAME, LOCALMAP_NAME, PPCA_NAME, KPPCA_NAME,
+    PCA_NAME,
+    TSNE_NAME,
+    UMAP_NAME,
+    PACMAP_NAME,
+    MDS_NAME,
+    LOCALMAP_NAME,
+    PPCA_NAME,
 ]
 
 # Distance metric types
@@ -28,10 +32,6 @@ METRIC_TYPES = Literal["euclidean", "cosine"]
 BACKGROUND_STRATEGY_TYPES = Literal[
     "pool", "complement", "length_matched", "stratified", "mixed", "isolate"
 ]
-
-# k-ρPCA kernel sources and kernel functions (paper 2)
-KERNEL_SOURCE_TYPES = Literal["embedding", "similarity", "precomputed"]
-KERNEL_TYPES = Literal["gaussian", "inverse_distance", "linear"]
 
 
 @dataclass(frozen=True)
@@ -63,18 +63,6 @@ class DimensionReductionConfig:
     standard_scale: bool = field(default=True)
     samples_per_target: int = field(default=3, metadata={"gt": 0})
     n_length_bins: int = field(default=10, metadata={"gt": 0})
-
-    # k-ρPCA parameters
-    kernel: KERNEL_TYPES = field(
-        default="gaussian",
-        metadata={"allowed": list(get_args(KERNEL_TYPES))},
-    )
-    kernel_source: KERNEL_SOURCE_TYPES = field(
-        default="embedding",
-        metadata={"allowed": list(get_args(KERNEL_SOURCE_TYPES))},
-    )
-    kernel_bandwidth: float = field(default=0.0, metadata={"gte": 0})
-    background_kernel: bool = field(default=False)
 
     def __post_init__(self):
         for f in fields(self):

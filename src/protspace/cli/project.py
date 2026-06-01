@@ -8,8 +8,6 @@ import typer
 
 from protspace.cli.app import app, setup_logging
 from protspace.cli.common_options import (
-    Kernel,
-    KernelSource,
     Metric,
     Opt_Eps,
     Opt_Fasta,
@@ -24,11 +22,6 @@ from protspace.cli.common_options import (
     Opt_NNeighbors,
     Opt_Perplexity,
     Opt_PpcaBackground,
-    Opt_KppcaKernel,
-    Opt_KppcaKernelBandwidth,
-    Opt_KppcaBackgroundKernel,
-    Opt_KppcaKernelPath,
-    Opt_KppcaKernelSource,
     Opt_RandomState,
     Opt_RegularizationMu,
     Opt_Similarity,
@@ -91,11 +84,6 @@ def project(
     ppca_samples_per_target: Opt_PpcaSamplesPerTarget = 3,
     ppca_background: Opt_PpcaBackground = None,
     standard_scale: Opt_StandardScale = True,
-    kppca_kernel: Opt_KppcaKernel = Kernel.gaussian,
-    kppca_kernel_source: Opt_KppcaKernelSource = KernelSource.embedding,
-    kppca_kernel_bandwidth: Opt_KppcaKernelBandwidth = 0.0,
-    kppca_kernel_path: Opt_KppcaKernelPath = None,
-    kppca_background_kernel: Opt_KppcaBackgroundKernel = False,
     verbose: Opt_Verbose = 0,
 ) -> None:
     """Run dimensionality reduction on HDF5 embeddings.
@@ -171,11 +159,6 @@ def project(
         stratify_by=_parse_csv(ppca_stratify_by),
         match_length=ppca_match_length,
         samples_per_target=ppca_samples_per_target,
-        kernel=kppca_kernel.value,
-        kernel_source=kppca_kernel_source.value,
-        kernel_bandwidth=kppca_kernel_bandwidth,
-        kernel_path=str(kppca_kernel_path) if kppca_kernel_path else "",
-        background_kernel=kppca_background_kernel,
     )
     global_params = asdict(reducer_params)
     reducers = get_reducers()

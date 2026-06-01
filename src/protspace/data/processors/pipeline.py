@@ -22,7 +22,7 @@ from protspace.data.loaders.embedding_set import (
 )
 from protspace.data.processors.base_processor import BaseProcessor
 from protspace.utils import get_reducers
-from protspace.utils.constants import KPPCA_NAME, MDS_NAME, PPCA_NAME
+from protspace.utils.constants import MDS_NAME, PPCA_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +30,6 @@ _CACHE_EXCLUDED_PARAM_KEYS = frozenset({
     "background_data",
     "target_data",
     "background_details",
-    "kernel_precomputed_matrix",
-    "kernel_similarity_matrix",
 })
 
 @dataclass(frozen=True)
@@ -57,11 +55,6 @@ class ReducerParams:
     match_length: bool = False
     samples_per_target: int = 3
     n_length_bins: int = 10
-    kernel: str = "gaussian"
-    kernel_source: str = "embedding"
-    kernel_bandwidth: float = 0.0
-    background_kernel: bool = False
-    kernel_path: str = ""
 
 @dataclass(frozen=True)
 class MethodSpec:
@@ -178,36 +171,15 @@ def _lengths_from_annotations(annot: pd.DataFrame, headers: list[str], column: s
     except (TypeError, ValueError):
         return None
 
-def _load_kernel_matrix(path: Path) -> np.ndarray:
-    suffix = path.suffix.lower()
-    if suffix == ".npy": K = np.load(path)
-    elif suffix in (".h5", ".hdf5"):
-        import h5py
-        with h5py.File(path, "r") as f:
-            keys = list(f.keys())
-            if not keys: raise ValueError(f"No datasets in {path}.")
-            K = np.asarray(f[keys[0]])
-    elif suffix == ".parquet":
-        import pyarrow.parquet as pq
-        table = pq.read_table(str(path)).to_pandas()
-        if "identifier" in table.columns: table = table.drop(columns=["identifier"])
-        K = table.to_numpy()
-    else:
-        raise ValueError(f"Unsupported kernel file format {suffix!r}.")
-    K = np.asarray(K, dtype=np.float64)
-    if K.ndim != 2 or K.shape[0] != K.shape[1]: raise ValueError(f"Kernel matrix must be square, got shape {K.shape}.")
-    return K
-
 class ReductionPipeline:
     def __init__(self, config: PipelineConfig):
         self.config = config
         reducer_dict = asdict(config.reducer_params)
         self.base = BaseProcessor(reducer_dict, get_reducers())
-        self._background_cache: np.ndarray | None = None
+        self._background_cache: dict[
+            str, tuple[np.ndarray, list[str], pd.DataFrame, np.ndarray | None]
+        ] = {}
         self._similarity_matrix_cache: np.ndarray | None = None
-        self._background_pool_headers: list[str] = []
-        self._background_pool_annotations: pd.DataFrame = pd.DataFrame()
-        self._background_pool_lengths: np.ndarray | None = None
         self._sequence_lengths: dict[str, np.ndarray] = {}
 
     def run(self, embedding_sets: list[EmbeddingSet]) -> Path:
@@ -415,22 +387,45 @@ class ReductionPipeline:
         if path is None: return
         np.savez(path, data=reduction["data"], info=np.array(json.dumps(reduction["info"])))
 
-    def _get_background_data(self) -> np.ndarray | None:
-        path_str = self.config.reducer_params.background_path
-        if not path_str: return None
-        if self._background_cache is None:
-            arr, headers = _load_background_h5(Path(path_str))
-            self._background_cache = arr
-            self._background_pool_headers = headers
+    def _get_background_pool(
+        self, background_path: str
+    ) -> tuple[np.ndarray, list[str], pd.DataFrame, np.ndarray | None]:
+        if not background_path:
+            raise ValueError("Missing ρPCA background_path.")
+        if background_path not in self._background_cache:
+            arr, headers = _load_background_h5(Path(background_path))
             pool_annot = self._fetch_annotations(headers)
-            self._background_pool_annotations = pool_annot
-            self._background_pool_lengths = _lengths_from_annotations(pool_annot, headers)
-        return self._background_cache
+            pool_lengths = _lengths_from_annotations(pool_annot, headers)
+            self._background_cache[background_path] = (
+                arr, headers, pool_annot, pool_lengths
+            )
+        return self._background_cache[background_path]
 
-    def _build_ppca_background(self, target_embeddings: np.ndarray, target_headers: list[str], target_annotations: pd.DataFrame, target_lengths: np.ndarray | None, rng: np.random.Generator):
-        from protspace.data.processors.background_strategies import (build_background, POOL, COMPLEMENT, LENGTH_MATCHED, STRATIFIED, MIXED, ISOLATE)
+    def _build_ppca_background(
+        self,
+        target_embeddings: np.ndarray,
+        target_headers: list[str],
+        target_annotations: pd.DataFrame,
+        target_lengths: np.ndarray | None,
+        rng: np.random.Generator,
+        effective_params: dict[str, Any],
+    ):
+        from types import SimpleNamespace
 
-        rp = self.config.reducer_params
+        from protspace.data.processors.background_strategies import (
+            build_background,
+            POOL,
+            COMPLEMENT,
+            LENGTH_MATCHED,
+            STRATIFIED,
+            MIXED,
+            ISOLATE,
+        )
+
+        # Use method-specific overrides when constructing the background.
+        # Previously this read self.config.reducer_params directly, so inline
+        # overrides such as -m 'ppca2:samples_per_target=5' were ignored.
+        rp = SimpleNamespace(**{**asdict(self.config.reducer_params), **effective_params})
         strategy = rp.background_strategy
 
         if strategy == COMPLEMENT:
@@ -441,10 +436,9 @@ class ReductionPipeline:
         else:
             if not rp.background_path:
                 raise ValueError(f"ρPCA strategy '{strategy}' requires an external pool (e.g. SwissProt). Pass --ppca-background <pool.h5>.")
-            pool_emb = self._get_background_data()
-            pool_headers = self._background_pool_headers
-            pool_annot = self._background_pool_annotations
-            pool_lengths = self._background_pool_lengths
+            pool_emb, pool_headers, pool_annot, pool_lengths = self._get_background_pool(
+                rp.background_path
+            )
 
         kwargs = dict(
             pool_embeddings=pool_emb, pool_headers=pool_headers, pool_annotations=pool_annot,
@@ -476,20 +470,6 @@ class ReductionPipeline:
 
         return build_background(strategy, **kwargs)
 
-    def _resolve_kppca_kernel(self, effective_params: dict) -> dict:
-        params = dict(effective_params)
-        source = params.get("kernel_source", "embedding")
-        if source == "precomputed":
-            path_str = params.get("kernel_path", "") or ""
-            if not path_str: raise ValueError("kppca with precomputed requires --kppca-kernel-path.")
-            params["kernel_precomputed_matrix"] = _load_kernel_matrix(Path(path_str))
-        elif source == "similarity":
-            sim = self._similarity_matrix_cache
-            if sim is None: raise ValueError("kppca with similarity requires --similarity (MMseqs2).")
-            params["kernel_similarity_matrix"] = sim
-        params.pop("kernel_path", None)
-        return params
-
     def _run_reductions(self, embedding_sets: list[EmbeddingSet], annotations_df: pd.DataFrame) -> list[dict[str, Any]]:
         all_reductions = []
         cached_projections: list[str] = []
@@ -519,11 +499,12 @@ class ReductionPipeline:
 
                 effective_params = {**global_params, **spec.overrides_dict}
 
-                if method == PPCA_NAME or method == KPPCA_NAME:
+                if method == PPCA_NAME:
                     spec_bg = self._build_ppca_background(
                         target_embeddings=emb_set.data, target_headers=emb_set.headers,
                         target_annotations=annotations_df, target_lengths=self._sequence_lengths.get(emb_set.name),
                         rng=np.random.default_rng(effective_params["random_state"]),
+                        effective_params=effective_params,
                     )
                     effective_params["background_data"] = spec_bg.X_background
                     effective_params["background_source"] = spec_bg.source
@@ -532,9 +513,6 @@ class ReductionPipeline:
 
                     if spec_bg.X_target is not None:
                         effective_params["target_data"] = spec_bg.X_target
-
-                    if method == KPPCA_NAME:
-                        effective_params = self._resolve_kppca_kernel(effective_params)
 
                 param_suffix = disambiguation_suffix(spec, method_counts)
                 cached = self._load_cached_projection(emb_set.name, method, dims, effective_params, param_suffix)

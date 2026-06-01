@@ -47,10 +47,6 @@ class BaseProcessor:
             "standard_scale",
             "samples_per_target",
             "n_length_bins",
-            "kernel",
-            "kernel_source",
-            "kernel_bandwidth",
-            "background_kernel",
         }
         filtered_config = {
             k: v for k, v in self.config.items() if k in valid_config_keys
@@ -66,8 +62,6 @@ class BaseProcessor:
             "background_source",
             "background_n_samples",
             "background_details",
-            "kernel_precomputed_matrix",
-            "kernel_similarity_matrix",
         ):
             if side_key in self.config and self.config[side_key] is not None:
                 object.__setattr__(config, side_key, self.config[side_key])

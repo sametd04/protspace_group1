@@ -18,7 +18,6 @@ def get_reducers() -> dict:
             PACMAP_NAME,
             PCA_NAME,
             PPCA_NAME,
-            KPPCA_NAME,
             TSNE_NAME,
             UMAP_NAME,
             LocalMAPReducer,
@@ -26,7 +25,6 @@ def get_reducers() -> dict:
             PaCMAPReducer,
             PCAReducer,
             PPCAReducer,
-            KPPCAReducer,
             TSNEReducer,
             UMAPReducer,
         )
@@ -39,7 +37,6 @@ def get_reducers() -> dict:
             MDS_NAME: MDSReducer,
             LOCALMAP_NAME: LocalMAPReducer,
             PPCA_NAME: PPCAReducer,
-            KPPCA_NAME: KPPCAReducer,
         }
     return _REDUCERS
 
@@ -63,7 +60,6 @@ def __getattr__(name: str):
         "MDS_NAME",
         "LOCALMAP_NAME",
         "PPCA_NAME",
-        "KPPCA_NAME",
         "REDUCERS",
     }
     if name in _reducer_attrs:
@@ -91,7 +87,6 @@ def __dir__():
         "MDS_NAME",
         "LOCALMAP_NAME",
         "PPCA_NAME",
-        "KPPCA_NAME",
     ]
 
 
