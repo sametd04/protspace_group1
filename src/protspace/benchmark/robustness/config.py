@@ -9,7 +9,7 @@ from __future__ import annotations
 KNN_K = 15
 
 # Common seed values for all methods
-COMMON_SEED_VALUES = [0, 7, 13, 21, 99]
+COMMON_SEED_VALUES = [0, 7, 13, 21, 99, 123, 256, 512, 1024]  # 42 is not included, because it's already used as the baseline random_state
 
 # Method-specific configurations
 METHOD_CONFIGS = {
@@ -23,7 +23,7 @@ METHOD_CONFIGS = {
         },
         "seed_values": COMMON_SEED_VALUES,
         "hyperparam_experiments": {
-            "n_neighbors": [5, 15, 50],
+            "n_neighbors": [3, 5, 10, 20, 50, 100],
             "min_dist": [0.0, 0.5, 0.8],
         },
     },
@@ -37,8 +37,8 @@ METHOD_CONFIGS = {
         },
         "seed_values": COMMON_SEED_VALUES,
         "hyperparam_experiments": {
-            "perplexity": [5, 30, 50],
-            "learning_rate": [50, 200, 500],
+            "perplexity": [5, 10, 20, 40, 50],  # perplexity has to be [5, 50] to run t-SNE
+            "learning_rate": [10, 50, 100, 300, 500, 1000],
         },
     },
     "pacmap": {
@@ -51,7 +51,7 @@ METHOD_CONFIGS = {
         },
         "seed_values": COMMON_SEED_VALUES,
         "hyperparam_experiments": {
-            "n_neighbors": [5, 10, 20, 50],
+            "n_neighbors": [3, 5, 10, 20, 50, 100],
             "mn_ratio": [0.1, 0.3, 0.6, 0.9],
             "fp_ratio": [1.0, 3.0, 4.0, 5.0],
         },
@@ -66,7 +66,7 @@ METHOD_CONFIGS = {
         },
         "seed_values": COMMON_SEED_VALUES,
         "hyperparam_experiments": {
-            "n_neighbors": [5, 10, 20, 50],
+            "n_neighbors": [3, 5, 10, 20, 50, 100],
             "mn_ratio": [0.1, 0.3, 0.6, 0.9],
             "fp_ratio": [1.0, 3.0, 4.0, 5.0],
         },
@@ -81,8 +81,8 @@ METHOD_CONFIGS = {
         },
         "seed_values": COMMON_SEED_VALUES,
         "hyperparam_experiments": {
-            "n_init": [1, 4, 8],
-            "max_iter": [100, 300, 500],
+            "n_init": [2, 8, 16],
+            "max_iter": [50, 100, 500, 1000],
             "eps": [1e-2, 1e-3, 1e-4],
         },
     },

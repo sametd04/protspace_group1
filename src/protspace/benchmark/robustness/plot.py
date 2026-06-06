@@ -3,6 +3,8 @@
 
 Visualizes seed robustness vs hyperparameter robustness for:
 UMAP, t-SNE, PaCMAP, LocalMAP, and MDS.
+
+Also provides group-level heatmap plotting for group-based analysis.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
 
 from protspace.benchmark.robustness.config import METHOD_CONFIGS
 
@@ -233,6 +236,68 @@ def main():
 
     # Print summary table
     print_summary_table(all_data)
+
+
+def plot_group_heatmap(
+    results_df: pd.DataFrame,
+    experiment_type: str,
+    output_path: Path,
+    knn_k: int = 15,
+    dataset_name: str = "Dataset",
+) -> None:
+    """Create heatmap of DR method robustness by protein group.
+    
+    Args:
+        results_df: DataFrame with columns: method, experiment_type, group, robustness
+        experiment_type: Which experiment type to plot
+        output_path: Path to save the heatmap
+        knn_k: Value of k for k-NN overlap
+        dataset_name: Name of dataset for title
+    """
+    # Filter to specific experiment type
+    plot_df = results_df[results_df["experiment_type"] == experiment_type].copy()
+
+    if len(plot_df) == 0:
+        print(f"No data for experiment type: {experiment_type}")
+        return
+
+    # Pivot for heatmap
+    heatmap_data = plot_df.pivot(
+        index="group", columns="method", values="robustness"
+    )
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(12, max(6, len(heatmap_data) * 0.5)))
+
+    # Create heatmap
+    sns.heatmap(
+        heatmap_data,
+        annot=True,
+        fmt=".3f",
+        cmap="RdYlGn",
+        vmin=0.0,
+        vmax=1.0,
+        center=0.8,
+        cbar_kws={"label": "k-NN Overlap (Robustness)"},
+        linewidths=0.5,
+        linecolor="gray",
+        ax=ax,
+    )
+
+    ax.set_title(
+        f"DR Method Robustness by Protein Group - {dataset_name}\n"
+        f"Experiment: {experiment_type.upper()} | k={knn_k}",
+        fontsize=14,
+        fontweight="bold",
+        pad=20,
+    )
+    ax.set_xlabel("DR Method", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Protein Group", fontsize=12, fontweight="bold")
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(f"✓ Saved heatmap: {output_path}")
+    plt.close()
 
 
 if __name__ == "__main__":
