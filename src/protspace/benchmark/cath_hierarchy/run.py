@@ -1,8 +1,13 @@
 """Orchestrator for the CATH hierarchy preservation evaluation.
 
-Loads embeddings, runs all (or selected) DR methods via the existing
-:func:`~protspace.benchmark.harness.benchmark_methods` harness, computes
-k-NN Hierarchy Purity (KHP) at all four CATH levels, and writes results.
+Loads embeddings, runs DR methods across multiple random seeds, computes
+k-NN Hierarchy Purity (KHP) with an adaptive per-level k, and compares
+against two references:
+
+* **Random baseline** — analytical expected KHP under a uniform random
+  projection (k-independent).
+* **Original Embedding** — KHP computed directly in the 1024-dimensional
+  ProtT5 space; an upper bound on what a 2D projection can achieve.
 """
 
 from __future__ import annotations
@@ -15,59 +20,67 @@ import pandas as pd
 
 from protspace.benchmark.cath_hierarchy.labels import CATHLabels, load_cath_labels
 from protspace.benchmark.cath_hierarchy.metrics import (
+    LEVEL_KEYS,
+    compute_adaptive_k,
+    compute_group_stats,
     compute_khp_baselines,
-    knn_hierarchy_purity,
-    make_khp_metrics,
+    knn_hierarchy_purity_adaptive,
 )
-from protspace.benchmark.harness import benchmark_methods
+from protspace.benchmark.harness import benchmark_method
 from protspace.utils.constants import REDUCER_METHODS, DimensionReductionConfig
 
 logger = logging.getLogger(__name__)
 
-# Ordered from finest to coarsest — used for display
-_LEVEL_ORDER = ["khp_homology", "khp_topology", "khp_architecture", "khp_class"]
+N_SEEDS_DEFAULT = 10
+DEFAULT_SEEDS = [0, 7, 13, 21, 42, 99, 123, 256, 512, 1024]
+
+# Display order: finest → coarsest
+_LEVEL_DISPLAY = ["homology", "topology", "architecture", "cath_class"]
 _LEVEL_LABELS = {
-    "khp_homology": "Homology (H)",
-    "khp_topology": "Topology (T)",
-    "khp_architecture": "Architecture (A)",
-    "khp_class": "Class (C)",
+    "homology": "Homology (H)",
+    "topology": "Topology (T)",
+    "architecture": "Architecture (A)",
+    "cath_class": "Class (C)",
 }
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 
 def run_cath_hierarchy_evaluation(
     h5_path: Path,
     output_dir: Path,
     methods: list[str] | None = None,
-    k: int = 5,
+    seeds: list[int] | None = None,
     config: DimensionReductionConfig | None = None,
     max_proteins: int | None = None,
 ) -> pd.DataFrame:
-    """Run CATH hierarchy preservation evaluation across DR methods.
+    """Run the full CATH hierarchy preservation evaluation.
 
     Parameters
     ----------
     h5_path:
         Path to ``data/cath_s40/prot_t5.h5``.
     output_dir:
-        Directory where results CSV and plots are saved.
+        Directory for results CSV.
     methods:
         DR methods to benchmark (default: all six).
-    k:
-        Number of nearest neighbours for KHP.
+    seeds:
+        Explicit list of seed values to use.  Overrides *n_seeds*.
+        Defaults to :data:`DEFAULT_SEEDS`.
     config:
-        :class:`~protspace.utils.constants.DimensionReductionConfig` to pass
-        to every DR method.  Uses defaults if *None*.
+        Base :class:`~protspace.utils.constants.DimensionReductionConfig`
+        (``random_state`` is overridden per seed).  Uses defaults if *None*.
     max_proteins:
-        If set, randomly subsample to this many proteins before running DR.
-        Useful for fast testing (e.g. ``max_proteins=500``).
+        Subsample to this many proteins for faster testing.
 
     Returns
     -------
-    DataFrame with columns:
-        ``method``, ``time_s``,
-        ``khp_homology``, ``khp_topology``, ``khp_architecture``, ``khp_class``,
-        ``baseline_homology``, ``baseline_topology``, ``baseline_architecture``,
-        ``baseline_class``, ``k``, ``n_valid``.
+    DataFrame with rows for each DR method plus "Original Embedding" and
+    "Random Baseline".  Columns include ``khp_{level}_mean``,
+    ``khp_{level}_std``, ``baseline_{level}``, ``k_{level}``.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -75,28 +88,29 @@ def run_cath_hierarchy_evaluation(
     if methods is None:
         methods = list(REDUCER_METHODS)
 
-    if config is None:
-        config = DimensionReductionConfig()
+    base_config = config or DimensionReductionConfig()
+    seed_list = seeds if seeds is not None else DEFAULT_SEEDS
 
     # ------------------------------------------------------------------
-    # 1. Load embeddings + CATH labels
+    # 1. Load embeddings + labels
     # ------------------------------------------------------------------
     logger.info("Loading CATH embeddings and hierarchy labels …")
     cath_labels: CATHLabels = load_cath_labels(h5_path)
-
     embeddings = cath_labels.embeddings
+
     logger.info(
-        "Dataset: %d proteins, %d with CATH labels, embedding dim=%d",
+        "Dataset: %d proteins (%d with CATH labels), embedding dim=%d",
         len(cath_labels.identifiers),
         cath_labels.n_valid,
         embeddings.shape[1],
     )
 
     if max_proteins is not None and len(cath_labels.identifiers) > max_proteins:
-        logger.info("Subsampling to %d proteins for speed …", max_proteins)
+        logger.info("Subsampling to %d proteins …", max_proteins)
         rng = np.random.default_rng(42)
-        idx = rng.choice(len(cath_labels.identifiers), size=max_proteins, replace=False)
-        idx.sort()
+        idx = np.sort(
+            rng.choice(len(cath_labels.identifiers), size=max_proteins, replace=False)
+        )
         embeddings = embeddings[idx]
         cath_labels = CATHLabels(
             identifiers=[cath_labels.identifiers[i] for i in idx],
@@ -107,128 +121,226 @@ def run_cath_hierarchy_evaluation(
             cath_class=cath_labels.cath_class[idx],
             valid_mask=cath_labels.valid_mask[idx],
         )
+
+    # ------------------------------------------------------------------
+    # 2. Group-size analysis → adaptive k
+    # ------------------------------------------------------------------
+    group_stats = compute_group_stats(cath_labels)
+    k_per_level = compute_adaptive_k(cath_labels)
+    _print_group_stats(group_stats, k_per_level)
+
+    # ------------------------------------------------------------------
+    # 3. Random baseline (analytical, k-independent)
+    # ------------------------------------------------------------------
+    baselines = compute_khp_baselines(cath_labels)
+
+    # ------------------------------------------------------------------
+    # 4. Original Embedding reference (high-D k-NN, run once)
+    # ------------------------------------------------------------------
+    logger.info(
+        "Computing KHP in original %d-dim embedding space …", embeddings.shape[1]
+    )
+    orig_khp = knn_hierarchy_purity_adaptive(embeddings, cath_labels, k_per_level)
+
+    # ------------------------------------------------------------------
+    # 5. Multi-seed DR evaluation
+    # ------------------------------------------------------------------
+    rows: list[dict] = []
+
+    for method in methods:
         logger.info(
-            "After subsample: %d proteins, %d with CATH labels",
-            len(cath_labels.identifiers),
-            cath_labels.n_valid,
+            "Method %s — running %d seeds %s …", method, len(seed_list), seed_list
+        )
+        seed_khp: list[dict[str, float]] = []
+
+        for seed in seed_list:
+            # Override random_state; keep all other params from base_config
+            cfg_dict = {
+                k: getattr(base_config, k) for k in base_config.__dataclass_fields__
+            }
+            cfg_dict["random_state"] = seed
+            seed_config = DimensionReductionConfig(**cfg_dict)
+
+            result = benchmark_method(
+                embeddings=embeddings,
+                method=method,
+                config=seed_config,
+                normalize=False,
+                metric_functions=None,
+            )
+            khp = knn_hierarchy_purity_adaptive(
+                result.projection, cath_labels, k_per_level
+            )
+            seed_khp.append(khp)
+            logger.debug(
+                "  seed=%d  homo=%.4f  topo=%.4f  arch=%.4f  class=%.4f",
+                seed,
+                khp["khp_homology"],
+                khp["khp_topology"],
+                khp["khp_architecture"],
+                khp["khp_cath_class"],
+            )
+
+        rows.append(
+            _aggregate_seeds(method, seed_khp, baselines, k_per_level, len(seed_list))
         )
 
     # ------------------------------------------------------------------
-    # 2. Build harness-compatible metric closures
+    # 6. Assemble DataFrame — DR methods + references
     # ------------------------------------------------------------------
-    metric_functions = make_khp_metrics(cath_labels, k=k)
-
-    # ------------------------------------------------------------------
-    # 3. Run all DR methods via the existing harness
-    # ------------------------------------------------------------------
-    logger.info("Benchmarking %d DR methods: %s", len(methods), methods)
-    benchmark_results = benchmark_methods(
-        embeddings=embeddings,
-        methods=methods,
-        config=config,
-        normalize=False,  # raw projection for accurate distance metrics
-        metric_functions=metric_functions,
+    orig_row = _make_reference_row(
+        "Original Embedding", orig_khp, baselines, k_per_level, n_seeds=1
     )
+    baseline_row = _make_baseline_row(baselines, k_per_level)
+
+    df = pd.DataFrame([orig_row] + rows + [baseline_row])
 
     # ------------------------------------------------------------------
-    # 4. Compute random baselines (independent of projection)
-    # ------------------------------------------------------------------
-    baselines = compute_khp_baselines(cath_labels)
-    logger.info(
-        "Random baselines (k-independent):  class=%.4f  arch=%.4f  topo=%.4f  homo=%.4f",
-        baselines["baseline_cath_class"],
-        baselines["baseline_architecture"],
-        baselines["baseline_topology"],
-        baselines["baseline_homology"],
-    )
-
-    # ------------------------------------------------------------------
-    # 5. Collect results into a DataFrame
-    # ------------------------------------------------------------------
-    rows = []
-    for method, result in benchmark_results.items():
-        # The harness already computed KHP via the metric closures.
-        # Also call knn_hierarchy_purity directly for n_valid / k provenance.
-        khp_full = knn_hierarchy_purity(result.projection, cath_labels, k=k)
-
-        row: dict[str, object] = {
-            "method": method,
-            "time_s": round(result.time_seconds, 2),
-            # Observed KHP
-            "khp_homology": result.metrics.get("khp_homology", float("nan")),
-            "khp_topology": result.metrics.get("khp_topology", float("nan")),
-            "khp_architecture": result.metrics.get("khp_architecture", float("nan")),
-            "khp_class": result.metrics.get("khp_class", float("nan")),
-            # Random baselines (same value for every method row — convenient for CSV)
-            "baseline_homology": baselines["baseline_homology"],
-            "baseline_topology": baselines["baseline_topology"],
-            "baseline_architecture": baselines["baseline_architecture"],
-            "baseline_class": baselines["baseline_cath_class"],
-            "k": int(khp_full["k"]),
-            "n_valid": int(khp_full["n_valid"]),
-        }
-        rows.append(row)
-
-    df = pd.DataFrame(rows)
-
-    # ------------------------------------------------------------------
-    # 5. Save results
+    # 7. Save + report
     # ------------------------------------------------------------------
     csv_path = output_dir / "cath_hierarchy_results.csv"
     df.to_csv(csv_path, index=False)
     logger.info("Results saved to %s", csv_path)
 
-    _print_table(df, k, baselines)
+    _print_table(df, k_per_level)
 
     return df
 
 
-def _print_table(df: pd.DataFrame, k: int, baselines: dict[str, float]) -> None:
-    """Print a formatted comparison table to stdout."""
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _aggregate_seeds(
+    method: str,
+    seed_khp: list[dict[str, float]],
+    baselines: dict[str, float],
+    k_per_level: dict[str, int],
+    n_seeds: int,
+) -> dict:
+    row: dict = {"method": method, "n_seeds": n_seeds}
+    for level in LEVEL_KEYS:
+        vals = np.array([r[f"khp_{level}"] for r in seed_khp])
+        row[f"khp_{level}_mean"] = float(np.mean(vals))
+        row[f"khp_{level}_std"] = float(np.std(vals, ddof=1) if len(vals) > 1 else 0.0)
+    _add_shared_cols(row, baselines, k_per_level)
+    return row
+
+
+def _make_reference_row(
+    name: str,
+    khp: dict[str, float],
+    baselines: dict[str, float],
+    k_per_level: dict[str, int],
+    n_seeds: int,
+) -> dict:
+    row: dict = {"method": name, "n_seeds": n_seeds}
+    for level in LEVEL_KEYS:
+        row[f"khp_{level}_mean"] = khp[f"khp_{level}"]
+        row[f"khp_{level}_std"] = 0.0
+    _add_shared_cols(row, baselines, k_per_level)
+    return row
+
+
+def _make_baseline_row(
+    baselines: dict[str, float], k_per_level: dict[str, int]
+) -> dict:
+    row: dict = {"method": "Random Baseline", "n_seeds": 0}
+    for level in LEVEL_KEYS:
+        row[f"khp_{level}_mean"] = baselines[f"baseline_{level}"]
+        row[f"khp_{level}_std"] = 0.0
+    _add_shared_cols(row, baselines, k_per_level)
+    return row
+
+
+def _add_shared_cols(
+    row: dict, baselines: dict[str, float], k_per_level: dict[str, int]
+) -> None:
+    for level in LEVEL_KEYS:
+        row[f"baseline_{level}"] = baselines[f"baseline_{level}"]
+        row[f"k_{level}"] = k_per_level[level]
+    row["n_valid"] = None  # filled externally if needed
+
+
+# ---------------------------------------------------------------------------
+# Console output
+# ---------------------------------------------------------------------------
+
+
+def _print_group_stats(stats: dict[str, dict], k_per_level: dict[str, int]) -> None:
+    print()
+    print("  CATH Group-Size Distribution (S40 dataset)")
+    print(
+        f"  {'Level':<14}  {'Groups':>7}  {'Median':>7}  {'Mean':>7}  "
+        f"{'p75':>5}  {'p90':>5}  {'Singles':>8}  {'k':>4}"
+    )
+    print("  " + "-" * 68)
+    for level in _LEVEL_DISPLAY:
+        s = stats[level]
+        k = k_per_level[level]
+        print(
+            f"  {level:<14}  {s['n_groups']:>7}  {s['median']:>7.1f}  "
+            f"{s['mean']:>7.1f}  {s['p75']:>5.0f}  {s['p90']:>5.0f}  "
+            f"{s['n_singletons']:>8}  {k:>4}"
+        )
+    print()
+
+
+def _print_table(df: pd.DataFrame, k_per_level: dict[str, int]) -> None:
+    k_h = k_per_level["homology"]
+    k_t = k_per_level["topology"]
+    k_a = k_per_level["architecture"]
+    k_c = k_per_level["cath_class"]
 
     def _fmt(v: object) -> str:
         try:
-            return f"{float(v):.4f}"  # type: ignore[arg-type]
+            f = float(v)  # type: ignore[arg-type]
+            return "  N/A  " if f != f else f"{f:.4f}"
         except (TypeError, ValueError):
-            return "   N/A"
+            return "  N/A  "
 
-    w = 76
+    def _fmts(v: object) -> str:
+        try:
+            f = float(v)  # type: ignore[arg-type]
+            return "       " if f != f or f == 0 else f"±{f:.4f}"
+        except (TypeError, ValueError):
+            return "       "
+
+    w = 98
     print()
     print("=" * w)
-    print(f"  CATH Hierarchy Preservation — k-NN Purity (k={k})")
+    print("  CATH Hierarchy Preservation — k-NN Purity (adaptive k, mean ± std)")
+    print(f"  k: Homology={k_h}  Topology={k_t}  Architecture={k_a}  Class={k_c}")
     print("=" * w)
-    header = (
-        f"  {'Method':<12}  {'Homology(H)':>12}  {'Topology(T)':>12}  "
-        f"{'Arch.(A)':>10}  {'Class(C)':>10}  {'time(s)':>8}"
+    hdr = (
+        f"  {'Method':<22}  {'Homology(H)':>18}  {'Topology(T)':>18}  "
+        f"{'Arch.(A)':>18}  {'Class(C)':>18}"
     )
-    print(header)
+    print(hdr)
     print("-" * w)
 
     for _, row in df.iterrows():
-        line = (
-            f"  {row['method']:<12}  "
-            f"{_fmt(row['khp_homology']):>12}  "
-            f"{_fmt(row['khp_topology']):>12}  "
-            f"{_fmt(row['khp_architecture']):>10}  "
-            f"{_fmt(row['khp_class']):>10}  "
-            f"{row['time_s']:>8.1f}"
-        )
-        print(line)
+        mean_h = _fmt(row["khp_homology_mean"])
+        std_h = _fmts(row["khp_homology_std"])
+        mean_t = _fmt(row["khp_topology_mean"])
+        std_t = _fmts(row["khp_topology_std"])
+        mean_a = _fmt(row["khp_architecture_mean"])
+        std_a = _fmts(row["khp_architecture_std"])
+        mean_c = _fmt(row["khp_cath_class_mean"])
+        std_c = _fmts(row["khp_cath_class_std"])
 
-    # Baseline row
-    print("-" * w)
-    baseline_line = (
-        f"  {'random baseline':<12}  "
-        f"{_fmt(baselines['baseline_homology']):>12}  "
-        f"{_fmt(baselines['baseline_topology']):>12}  "
-        f"{_fmt(baselines['baseline_architecture']):>10}  "
-        f"{_fmt(baselines['baseline_cath_class']):>10}  "
-        f"{'':>8}"
-    )
-    print(baseline_line)
+        method = str(row["method"])
+        separator = "─" * w if method == "Random Baseline" else None
+        if separator:
+            print(separator)
+        print(
+            f"  {method:<22}  {mean_h} {std_h}  {mean_t} {std_t}  "
+            f"{mean_a} {std_a}  {mean_c} {std_c}"
+        )
+
     print("=" * w)
     print(
-        "  Observed ordering is always Class > Architecture > Topology > Homology\n"
-        "  (driven by group size, not projection quality — see metrics.py docstring)\n"
-        "  Compare values across methods at the same level to assess DR quality.\n"
+        "  Ordering within each column: Original Embedding ≥ DR method > Random Baseline\n"
+        "  Observed level ordering (class > arch > topo > homo) is driven by group size.\n"
     )

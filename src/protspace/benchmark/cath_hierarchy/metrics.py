@@ -162,7 +162,164 @@ def knn_hierarchy_purity(
 
 
 # ---------------------------------------------------------------------------
-# Harness-compatible factory functions
+# Adaptive k and group-size utilities
+# ---------------------------------------------------------------------------
+
+#: Level keys used throughout this module (coarse → fine)
+LEVEL_KEYS: list[str] = ["cath_class", "architecture", "topology", "homology"]
+
+
+def compute_group_stats(labels: CATHLabels) -> dict[str, dict]:
+    """Return group-size statistics at each CATH level.
+
+    Returns
+    -------
+    dict keyed by level name.  Each value has:
+    ``n_groups``, ``min``, ``p25``, ``median``, ``p75``, ``p90``, ``max``,
+    ``mean``, ``n_singletons``.
+    """
+    import math
+    import statistics as _stats
+
+    level_arrays = {
+        "cath_class": labels.cath_class,
+        "architecture": labels.architecture,
+        "topology": labels.topology,
+        "homology": labels.homology,
+    }
+    out: dict[str, dict] = {}
+    for level_key, arr in level_arrays.items():
+        valid = arr[labels.valid_mask]
+        counts = Counter(valid.tolist())
+        sizes = sorted(counts.values())
+        a = np.array(sizes, dtype=float)
+        out[level_key] = {
+            "n_groups": len(sizes),
+            "min": int(sizes[0]),
+            "p25": float(np.percentile(a, 25)),
+            "median": float(_stats.median(sizes)),
+            "p75": float(np.percentile(a, 75)),
+            "p90": float(np.percentile(a, 90)),
+            "max": int(sizes[-1]),
+            "mean": float(a.mean()),
+            "n_singletons": int(sum(1 for s in sizes if s == 1)),
+        }
+    # suppress unused import warning
+    _ = math
+    return out
+
+
+def compute_adaptive_k(labels: CATHLabels) -> dict[str, int]:
+    """Compute an adaptive k for each CATH level based on group-size distribution.
+
+    Formula: ``k_l = min(15, max(2, floor(median_group_size_l / 2)))``
+
+    Rationale
+    ---------
+    * Using a single fixed k is unfair across levels whose group sizes differ by
+      orders of magnitude (5 classes with ~600 members vs. 1 163 homology
+      superfamilies with median size 1).
+    * Dividing the median by 2 ensures k stays well below the typical group size,
+      so it is *possible* to achieve high purity.  Floor and clamp keep values
+      in the range [2, 15].
+
+    For topology and homology (median = 1 in S40), the formula gives k=2 — the
+    smallest meaningful value.  This reflects that >50 % of superfamilies have
+    only one S40 representative; k=2 asks whether the nearest neighbour shares
+    the same label.
+
+    Returns
+    -------
+    dict with keys ``"cath_class"``, ``"architecture"``, ``"topology"``,
+    ``"homology"``.
+    """
+    import math
+
+    stats = compute_group_stats(labels)
+    return {
+        level_key: min(15, max(2, math.floor(info["median"] / 2)))
+        for level_key, info in stats.items()
+    }
+
+
+def knn_hierarchy_purity_adaptive(
+    coords: np.ndarray,
+    labels: CATHLabels,
+    k_per_level: dict[str, int],
+) -> dict[str, float]:
+    """k-NN Hierarchy Purity with a different k at each CATH level.
+
+    Builds **one** k-NN tree (with k = max of all per-level k values) and
+    slices the neighbour list per level.  Works with embeddings of any
+    dimensionality, including the original high-dimensional space.
+
+    Parameters
+    ----------
+    coords:
+        Coordinate matrix, shape ``(n, d)``.  May be 2D projections or the
+        raw high-dimensional embeddings.
+    labels:
+        :class:`CATHLabels` aligned with ``coords``.
+    k_per_level:
+        dict mapping level key → k, e.g. ``{"cath_class": 15, ...}``.
+
+    Returns
+    -------
+    dict with keys ``"khp_{level}"``, ``"k_{level}"``, ``"n_valid"``.
+    """
+    if coords.shape[0] != len(labels.identifiers):
+        raise ValueError(
+            f"coords has {coords.shape[0]} rows but labels has "
+            f"{len(labels.identifiers)} entries"
+        )
+
+    valid_idx = np.where(labels.valid_mask)[0]
+    n_valid = len(valid_idx)
+    max_k = max(k_per_level.values())
+
+    # Cap at n_valid - 1 to avoid requesting more neighbours than points
+    actual_k = min(max_k + 1, n_valid)  # +1: first neighbour is self
+    nbrs = NearestNeighbors(n_neighbors=actual_k, metric="euclidean", algorithm="auto")
+    nbrs.fit(coords[valid_idx])
+    _, all_indices = nbrs.kneighbors(coords[valid_idx])
+    all_indices = all_indices[:, 1:]  # drop self → shape (n_valid, max_k)
+
+    level_arrays = {
+        "cath_class": labels.cath_class[valid_idx],
+        "architecture": labels.architecture[valid_idx],
+        "topology": labels.topology[valid_idx],
+        "homology": labels.homology[valid_idx],
+    }
+
+    results: dict[str, float] = {"n_valid": float(n_valid)}
+    for level_key, level_labels in level_arrays.items():
+        k = min(k_per_level[level_key], all_indices.shape[1])
+        neighbor_idx = all_indices[:, :k]
+        results[f"k_{level_key}"] = float(k)
+
+        purities: list[float] = []
+        for i in range(n_valid):
+            own = level_labels[i]
+            if not own:
+                continue
+            nbr_labels = level_labels[neighbor_idx[i]]
+            purities.append(float(np.sum(nbr_labels == own)) / k)
+
+        results[f"khp_{level_key}"] = (
+            float(np.mean(purities)) if purities else float("nan")
+        )
+        logger.debug(
+            "KHP_adaptive @ %-14s k=%2d  purity=%.4f",
+            level_key,
+            k,
+            results[f"khp_{level_key}"],
+        )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Harness-compatible factory functions (fixed-k, kept for backward compat)
 # ---------------------------------------------------------------------------
 # The benchmark harness expects callables with signature:
 #   (embeddings: np.ndarray, projection: np.ndarray) -> float
