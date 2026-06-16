@@ -208,12 +208,12 @@ def plot_cross_dataset_summary(all_results: dict, output_dir: Path):
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     colors = {"PCA": "#4C72B0", "UMAP": "#55A868", "pPCA": "#C44E52"}
 
+    global_min = 1.0
     for ax_idx, k in enumerate(k_show):
         ax = axes[ax_idx]
         x = np.arange(len(datasets))
         width = 0.25
 
-        # Determine which methods are present across all datasets
         all_methods = set()
         for ds in datasets:
             all_methods.update(all_results[ds].keys())
@@ -221,26 +221,32 @@ def plot_cross_dataset_summary(all_results: dict, output_dir: Path):
 
         for i, method in enumerate(methods_ordered):
             means, errors_low, errors_high = [], [], []
-            for ds in datasets:
+            positions = []
+            for j, ds in enumerate(datasets):
                 if method in all_results[ds]:
                     mean, low, high = compute_ci(all_results[ds][method][k])
                     means.append(mean)
                     errors_low.append(mean - low)
                     errors_high.append(high - mean)
+                    global_min = min(global_min, low)
                 else:
-                    means.append(0)
+                    means.append(np.nan)
                     errors_low.append(0)
                     errors_high.append(0)
+                positions.append(j)
 
             offset = (i - len(methods_ordered) / 2 + 0.5) * width
-            bars = ax.bar(
-                x + offset, means, width,
+            pos_arr = np.array(positions) + offset
+            means_arr = np.array(means)
+            valid = ~np.isnan(means_arr)
+            ax.bar(
+                pos_arr[valid], means_arr[valid], width,
                 label=method, color=colors[method],
                 edgecolor="black", linewidth=0.5,
             )
             ax.errorbar(
-                x + offset, means,
-                yerr=[errors_low, errors_high],
+                pos_arr[valid], means_arr[valid],
+                yerr=[np.array(errors_low)[valid], np.array(errors_high)[valid]],
                 fmt="none", capsize=4, capthick=1, ecolor="black",
             )
 
@@ -250,8 +256,10 @@ def plot_cross_dataset_summary(all_results: dict, output_dir: Path):
         ax.set_xticks(x)
         ax.set_xticklabels(datasets, fontsize=10)
         ax.legend(fontsize=10)
-        ax.set_ylim(0.85, 1.01)
         ax.grid(True, alpha=0.2, axis="y")
+
+    for ax in axes:
+        ax.set_ylim(0, 1.05)
 
     fig.suptitle(
         f"Cross-Dataset Trustworthiness Comparison\n"
