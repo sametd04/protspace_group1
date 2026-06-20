@@ -28,7 +28,7 @@ class BaseProcessor:
         self, data: np.ndarray, method: str, dims: int
     ) -> dict[str, Any]:
         """Process a single reduction method."""
-        # Filter config to only include parameters accepted by DimensionReductionConfig
+        # Keys consumed by DimensionReductionConfig (dataclass fields).
         valid_config_keys = {
             "n_neighbors",
             "metric",
@@ -42,17 +42,26 @@ class BaseProcessor:
             "max_iter",
             "eps",
             "random_state",
+            "regularization_mu",
+            "background_ratio",
+            "background_strategy",
+            "standard_scale",
         }
         filtered_config = {
             k: v for k, v in self.config.items() if k in valid_config_keys
         }
         config = DimensionReductionConfig(n_components=dims, **filtered_config)
 
+        # ρPCA-only side channel for the external background ndarray.
+        # DimensionReductionConfig is frozen, so we attach via __setattr__
+        # on the underlying dict. The reducer reads it with
+        # getattr(cfg, "background_data", None).
+        if "background_data" in self.config and self.config["background_data"] is not None:
+            object.__setattr__(config, "background_data", self.config["background_data"])
+
         # Special handling for MDS when using similarity matrix
         if method == MDS_NAME and config.precomputed is True:
-            # Convert similarity to dissimilarity matrix if needed
             if np.allclose(np.diag(data), 1):
-                # Convert similarity to distance: d = sqrt(max(s) - s)
                 max_sim = np.max(data)
                 data = np.sqrt(max_sim - data)
 
@@ -60,15 +69,10 @@ class BaseProcessor:
         if not reducer_cls:
             raise ValueError(f"Unknown reduction method: {method}")
 
-        # Upcast float16 to float32 to avoid overflow in matrix operations
         if data.dtype == np.float16:
             data = data.astype(np.float32)
 
         reducer = reducer_cls(config)
-        # Suppress noisy but harmless warnings from DR libraries:
-        # - sklearn RuntimeWarning: overflow in randomized SVD matmul (results still correct)
-        # - umap UserWarning: n_jobs overridden by random_state (informational)
-        # - pacmap logger.warning: "random state is set to ..." (informational)
         pacmap_logger = logging.getLogger("pacmap.pacmap")
         prev_level = pacmap_logger.level
         pacmap_logger.setLevel(logging.ERROR)
@@ -98,7 +102,6 @@ class BaseProcessor:
         reductions: list[dict[str, Any]],
         headers: list[str],
     ) -> dict[str, pa.Table]:
-        """Create the final output as Apache Arrow tables."""
         return {
             "protein_annotations": self._create_protein_annotations_table(metadata),
             "projections_metadata": self._create_projections_metadata_table(reductions),
@@ -110,14 +113,6 @@ class BaseProcessor:
     def save_output(
         self, data: dict[str, pa.Table], output_path: Path, bundled: bool = True
     ):
-        """Save output data to Parquet files using Apache Arrow.
-
-        Args:
-            data: Dictionary of Apache Arrow tables to save
-            output_path: Path for output (file or directory)
-            bundled: Whether to bundle into single .parquetbundle file
-        """
-        # Custom filename mapping for better naming
         filename_mapping = {
             "protein_annotations": "selected_annotations.parquet",
             "projections_metadata": "projections_metadata.parquet",
@@ -125,7 +120,6 @@ class BaseProcessor:
         }
 
         if bundled:
-            # Determine the bundle file path
             if output_path.suffix == ".parquetbundle":
                 bundle_path = output_path
             elif output_path.suffix:
@@ -140,28 +134,22 @@ class BaseProcessor:
 
             write_bundle(list(data.values()), bundle_path)
         else:
-            # Save as separate parquet files
-            # output_path must be a directory
-            base_path = output_path.with_suffix("")  # Remove any extension
+            base_path = output_path.with_suffix("")
             base_path.mkdir(parents=True, exist_ok=True)
 
             for table_name, table in data.items():
                 filename = filename_mapping.get(table_name, f"{table_name}.parquet")
                 table_path = base_path / filename
-
-                # Overwrite existing files
                 pq.write_table(table, str(table_path))
 
             logger.info(f"Saved separate parquet files to: {base_path}")
 
     def _create_protein_annotations_table(self, metadata: pd.DataFrame) -> pa.Table:
-        """Create Apache Arrow table for protein annotations in wide format."""
         df = metadata.copy()
 
         if self.identifier_col != "protein_id":
             df = df.rename(columns={self.identifier_col: "protein_id"})
 
-        # Remove internal columns that are only needed for processing/caching
         internal_columns = ["organism_id", "sequence"]
         cols_to_drop = [c for c in internal_columns if c in df.columns]
         if cols_to_drop:
@@ -174,7 +162,6 @@ class BaseProcessor:
     def _create_projections_metadata_table(
         self, reductions: list[dict[str, Any]]
     ) -> pa.Table:
-        """Create Apache Arrow table for projection metadata."""
         rows = []
         for reduction in reductions:
             rows.append(
@@ -191,7 +178,6 @@ class BaseProcessor:
     def _create_projections_data_table(
         self, reductions: list[dict[str, Any]], headers: list[str]
     ) -> pa.Table:
-        """Create Apache Arrow table for projection coordinates."""
         rows = []
         for reduction in reductions:
             for i, header in enumerate(headers):

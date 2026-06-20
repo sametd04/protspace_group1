@@ -1,7 +1,4 @@
-"""Shared Typer option type aliases for CLI commands.
-
-Import these in any CLI command to avoid duplicating option definitions.
-"""
+"""Shared Typer option type aliases for CLI commands."""
 
 from enum import Enum
 from pathlib import Path
@@ -16,6 +13,15 @@ class Metric(str, Enum):
     manhattan = "manhattan"
 
 
+class BackgroundStrategy(str, Enum):
+    """Sampling policy for the ρPCA background set."""
+
+    external = "external"
+    random = "random"
+    uniform = "uniform"
+    outlier = "outlier"
+
+
 # ---------------------------------------------------------------------------
 # Shared option types
 # ---------------------------------------------------------------------------
@@ -25,7 +31,6 @@ Opt_Verbose = Annotated[
     typer.Option("-v", "--verbose", count=True, help="Verbosity: -v=INFO, -vv=DEBUG."),
 ]
 
-# Projection options (shared by prepare and project)
 Opt_Methods = Annotated[
     list[str] | None,
     typer.Option(
@@ -111,7 +116,74 @@ Opt_Eps = Annotated[
     typer.Option(help="MDS convergence tolerance.", rich_help_panel="Projection"),
 ]
 
-# Embedding options (shared by prepare and embed)
+# ρPCA-specific options
+Opt_RegularizationMu = Annotated[
+    float,
+    typer.Option(
+        "--regularization-mu",
+        help=(
+            "ρPCA Tikhonov regularization μ added to the background "
+            "covariance Σ_B. Must be ≥ 0. Default 1e-3 is safe for PLM "
+            "embeddings; reduce to 0 only if the background is well-"
+            "conditioned (n_background ≫ n_features)."
+        ),
+        rich_help_panel="Projection",
+        min=0.0,
+    ),
+]
+Opt_BackgroundRatio = Annotated[
+    float,
+    typer.Option(
+        "--background-ratio",
+        help=(
+            "ρPCA fraction of input samples used as background in "
+            "auto-split modes. Ignored when --ppca-background is set. "
+            "Must lie strictly in (0, 1)."
+        ),
+        rich_help_panel="Projection",
+        min=0.0,
+        max=1.0,
+    ),
+]
+Opt_BackgroundStrategy = Annotated[
+    BackgroundStrategy,
+    typer.Option(
+        "--background-strategy",
+        help=(
+            "ρPCA background construction policy. 'external' uses the "
+            "dataset from --ppca-background; 'random', 'uniform', and "
+            "'outlier' partition the target. If --ppca-background is "
+            "set, this flag is overridden to 'external'."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaBackground = Annotated[
+    Path | None,
+    typer.Option(
+        "--ppca-background",
+        help=(
+            "Path to an HDF5 file holding background embeddings for ρPCA "
+            "(canonical mode per Carilli/Jackson/Pachter 2025). Must have "
+            "the same embedding dimension as the target. Identifiers are "
+            "not required to overlap with the target."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_StandardScale = Annotated[
+    bool,
+    typer.Option(
+        "--standard-scale/--no-standard-scale",
+        help=(
+            "Per-set standard-scale target and background before computing "
+            "covariances (paper convention). Strongly recommended for PLM "
+            "embeddings whose dimensions have heterogeneous scale."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+
 Opt_BatchSize = Annotated[
     int,
     typer.Option(
@@ -119,7 +191,6 @@ Opt_BatchSize = Annotated[
     ),
 ]
 
-# Input options (shared by prepare and project)
 Opt_Fasta = Annotated[
     Path | None,
     typer.Option(

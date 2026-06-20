@@ -18,7 +18,10 @@ import typer
 
 from protspace.cli.app import app, setup_logging
 from protspace.cli.common_options import (
+    BackgroundStrategy,
     Metric,
+    Opt_BackgroundRatio,
+    Opt_BackgroundStrategy,
     Opt_BatchSize,
     Opt_Eps,
     Opt_Fasta,
@@ -32,8 +35,11 @@ from protspace.cli.common_options import (
     Opt_NInit,
     Opt_NNeighbors,
     Opt_Perplexity,
+    Opt_PpcaBackground,
     Opt_RandomState,
+    Opt_RegularizationMu,
     Opt_Similarity,
+    Opt_StandardScale,
     Opt_Verbose,
 )
 
@@ -56,11 +62,6 @@ EMBEDDER_MODELS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Prepare-specific option type aliases
-# ---------------------------------------------------------------------------
-
-# Input
 Opt_Input = Annotated[
     list[str] | None,
     typer.Option(
@@ -80,7 +81,6 @@ Opt_Query = Annotated[
     ),
 ]
 
-# Embedding
 Opt_Embedder = Annotated[
     str | None,
     typer.Option(
@@ -90,20 +90,18 @@ Opt_Embedder = Annotated[
             "pLM model(s), comma-separated. "
             "Models: prot_t5, prost_t5, esm2_8m, esm2_35m, esm2_150m, "
             "esm2_650m, esm2_3b, ankh_base, ankh_large, ankh3_large, "
-            "esmc_300m, esmc_600m. "
-            "Note: ankh_*, ankh3_*, esmc_600m are non-commercial licenses."
+            "esmc_300m, esmc_600m."
         ),
         rich_help_panel="Embedding",
     ),
 ]
 
-# Annotations
 Opt_Annotations = Annotated[
     list[str] | None,
     typer.Option(
         "-a",
         "--annotations",
-        help=f"Annotation groups (default,all,uniprot,interpro,taxonomy,ted,biocentral), individual names, or a CSV/TSV file path. Repeatable. See {ANNOTATIONS_URL}",
+        help=f"Annotation groups, individual names, or a CSV/TSV file path. Repeatable. See {ANNOTATIONS_URL}",
         rich_help_panel="Annotations",
     ),
 ]
@@ -129,13 +127,7 @@ REFETCH_STAGES = frozenset(
     }
 )
 ANNOTATION_SOURCES = frozenset(
-    {
-        "uniprot",
-        "taxonomy",
-        "interpro",
-        "ted",
-        "biocentral",
-    }
+    {"uniprot", "taxonomy", "interpro", "ted", "biocentral"}
 )
 REFETCH_SHORTHANDS: dict[str, frozenset[str]] = {
     "all": REFETCH_STAGES,
@@ -155,7 +147,6 @@ Opt_Refetch = Annotated[
     ),
 ]
 
-# Output
 Opt_Output = Annotated[
     Path,
     typer.Option("-o", "--output", help="Output directory.", rich_help_panel="Output"),
@@ -189,13 +180,7 @@ Opt_NoLog = Annotated[
 ]
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _parse_refetch(raw: str | None) -> frozenset[str]:
-    """Parse ``--refetch`` value into a set of stage names."""
     if not raw:
         return frozenset()
     stages: set[str] = set()
@@ -225,13 +210,11 @@ def _embed_all(
     *,
     force_reembed: bool = False,
 ) -> list[str]:
-    """Embed all models, return list of cache-hit model names."""
     from protspace.data.loaders.fasta import embed_fasta
 
     cached_names: list[str] = []
     for emb_name in embedders:
         emb_cache = cache_dir / f"{emb_name}.h5" if cache_dir else None
-        # Delete cache to force re-embedding
         if force_reembed and emb_cache and emb_cache.exists():
             emb_cache.unlink()
         old_mtime = (
@@ -245,7 +228,6 @@ def _embed_all(
         )
         emb_set.fasta_path = fasta_path
         embedding_sets.append(emb_set)
-        # Cache hit if file existed before and was not modified
         if old_mtime is not None and emb_cache.stat().st_mtime == old_mtime:
             cached_names.append(emb_name)
 
@@ -259,21 +241,13 @@ def _embed_all(
     return cached_names
 
 
-# ---------------------------------------------------------------------------
-# Command
-# ---------------------------------------------------------------------------
-
-
 @app.command()
 def prepare(
-    # Input
     input: Opt_Input = None,
     query: Opt_Query = None,
     fasta: Opt_Fasta = None,
-    # Embedding
     embedder: Opt_Embedder = None,
     batch_size: Opt_BatchSize = 1000,
-    # Projection
     methods: Opt_Methods = None,
     similarity: Opt_Similarity = False,
     metric: Opt_Metric = Metric.euclidean,
@@ -287,17 +261,20 @@ def prepare(
     n_init: Opt_NInit = 4,
     max_iter: Opt_MaxIter = 300,
     eps: Opt_Eps = 1e-3,
-    # Annotations
+    # ρPCA-specific options
+    regularization_mu: Opt_RegularizationMu = 1e-3,
+    background_ratio: Opt_BackgroundRatio = 0.3,
+    background_strategy: Opt_BackgroundStrategy = BackgroundStrategy.outlier,
+    ppca_background: Opt_PpcaBackground = None,
+    standard_scale: Opt_StandardScale = True,
     annotations: Opt_Annotations = None,
     scores: Opt_Scores = True,
     refetch: Opt_Refetch = None,
-    # Output
     output: Opt_Output = Path("."),
     keep_tmp: Opt_KeepTmp = True,
     bundled: Opt_Bundled = True,
     dump_cache: Opt_DumpCache = False,
     no_log: Opt_NoLog = False,
-    # General
     verbose: Opt_Verbose = 0,
 ) -> None:
     """Prepare protein data for visualization (full pipeline).
@@ -339,7 +316,6 @@ def prepare(
         embedders = [DEFAULT_EMBEDDER]
         logger.info(f"FASTA detected, defaulting to '{embedders[0]}'")
 
-    # --- Output and cache paths ---
     output_dir = output if output.suffix == "" else output.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -356,7 +332,6 @@ def prepare(
     else:
         output_path = output_dir
 
-    # --- Dump cache ---
     if dump_cache:
         if not cache_dir:
             logger.error("No cache. Use --keep-tmp.")
@@ -370,7 +345,6 @@ def prepare(
             logger.error(f"No cache at {cache_path}.")
         return
 
-    # --- Build embedding sets ---
     from protspace.data.embedding.biocentral import EmbedConfig
     from protspace.data.loaders import EmbeddingSet, load_h5
     from protspace.data.loaders.h5 import EMBEDDING_EXTENSIONS
@@ -430,7 +404,6 @@ def prepare(
                     embedding_sets.append(load_h5(h5s, name_override=name_override))
                 elif path.suffix.lower() in EMBEDDING_EXTENSIONS:
                     emb_set = load_h5([path], name_override=name_override)
-                    # Attach FASTA path from -f flag if provided (for sequence reuse)
                     if fasta_for_similarity:
                         emb_set.fasta_path = fasta_for_similarity
                     embedding_sets.append(emb_set)
@@ -450,7 +423,6 @@ def prepare(
         if not embedding_sets:
             raise typer.BadParameter("No valid input data found.")
 
-        # --- Similarity ---
         if similarity:
             if fasta_for_similarity is None:
                 raise typer.BadParameter(
@@ -467,7 +439,6 @@ def prepare(
                 )
             )
 
-        # --- Parse annotations (repeatable option → flat list) ---
         raw = annotations if annotations else ["default"]
         annotation_list = []
         for item in raw:
@@ -476,7 +447,6 @@ def prepare(
                 if part:
                     annotation_list.append(part)
 
-        # --- Run pipeline ---
         from protspace.data.processors.pipeline import (
             PipelineConfig,
             ReducerParams,
@@ -498,6 +468,11 @@ def prepare(
             n_init=n_init,
             max_iter=max_iter,
             eps=eps,
+            regularization_mu=regularization_mu,
+            background_ratio=background_ratio,
+            background_strategy=background_strategy.value,
+            standard_scale=standard_scale,
+            background_path=str(ppca_background) if ppca_background else "",
         )
         config = PipelineConfig(
             methods=method_specs,
@@ -523,7 +498,6 @@ def prepare(
         logger.error(str(e))
         raise typer.Exit(1) from e
 
-    # --- Run log ---
     if not no_log:
         _write_run_log(
             output_dir=output_dir,
@@ -542,13 +516,7 @@ def prepare(
         )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _parse_input_specs(raw_inputs: list[str]) -> list[tuple[Path, str | None]]:
-    """Parse inputs with optional colon name override: file.h5:model_name."""
     specs: list[tuple[Path, str | None]] = []
     for raw in raw_inputs:
         if ":" in raw:
@@ -568,7 +536,6 @@ def _parse_input_specs(raw_inputs: list[str]) -> list[tuple[Path, str | None]]:
 
 
 def _parse_embedders(embedder_arg: str | None) -> list[str]:
-    """Parse comma-separated embedder string into validated list."""
     if not embedder_arg:
         return []
     embedders = [e.strip() for e in embedder_arg.split(",") if e.strip()]
@@ -581,7 +548,6 @@ def _parse_embedders(embedder_arg: str | None) -> list[str]:
 
 
 def _format_duration(seconds: float) -> str:
-    """Format seconds into a human-readable duration string."""
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
     if h:
@@ -589,6 +555,59 @@ def _format_duration(seconds: float) -> str:
     if m:
         return f"{m}m {s}s"
     return f"{s}s"
+
+def _collect_projection_diagnostics(
+    output_path: Path, bundled: bool
+) -> list[tuple[str, dict]]:
+    """Read post-fit diagnostics (e.g. ρPCA eigenvalue ratios) from the
+    just-written projection metadata.
+
+    Returns a list of (projection_name, info_dict) tuples in the order the
+    projections were written. Returns an empty list on any read failure so
+    the rest of the run.log still writes.
+    """
+    import io
+    import json
+
+    try:
+        if bundled:
+            # A .parquetbundle is (list[bytes], settings_or_None) where each
+            # blob is a serialized parquet table. Find the one whose schema
+            # contains "info_json" — that's projections_metadata.
+            import pyarrow.parquet as pq
+
+            from protspace.data.io.bundle import read_bundle
+
+            table_blobs, _ = read_bundle(output_path)
+            metadata_table = None
+            for blob in table_blobs:
+                table = pq.read_table(io.BytesIO(blob))
+                if "info_json" in table.column_names:
+                    metadata_table = table
+                    break
+            if metadata_table is None:
+                logger.warning(
+                    f"Could not find projections_metadata table in bundle "
+                    f"{output_path}"
+                )
+                return []
+            df = metadata_table.to_pandas()
+        else:
+            import pandas as pd
+
+            df = pd.read_parquet(output_path / "projections_metadata.parquet")
+
+        out: list[tuple[str, dict]] = []
+        for _, row in df.iterrows():
+            try:
+                info = json.loads(row["info_json"])
+            except (TypeError, ValueError):
+                info = {}
+            out.append((str(row["projection_name"]), info))
+        return out
+    except Exception as exc:  # noqa: BLE001 — diagnostic, never block log
+        logger.warning(f"Could not read projection diagnostics: {exc}")
+        return []
 
 
 def _write_run_log(
@@ -607,12 +626,6 @@ def _write_run_log(
     n_proteins: int,
     n_embedding_sets: int,
 ) -> None:
-    """Write a reproducibility log to {output_dir}/run.log.
-
-    Config objects are serialized automatically via ``dataclasses.asdict()``,
-    so adding new fields to ``EmbedConfig`` or ``ReducerParams`` requires
-    no changes here.
-    """
     import protspace
 
     ts_end = datetime.now(timezone.utc)
@@ -649,6 +662,28 @@ def _write_run_log(
     lines.append(f"similarity: {similarity}")
     for key, val in rp.items():
         lines.append(f"{key}: {val}")
+
+    # Per-projection post-fit diagnostics (eigenvalue ratios, background
+    # source, n_background_samples, ...). Read back from the output bundle
+    # so we don't need to thread reductions through the pipeline API.
+    diagnostics = _collect_projection_diagnostics(
+        output_path, bundled=pipeline_config.bundled
+    )
+    if diagnostics:
+        lines += ["", "## Projection diagnostics"]
+        for name, info in diagnostics:
+            lines.append(f"### {name}")
+            if not info:
+                lines.append("(no diagnostics recorded)")
+                continue
+            for key, val in info.items():
+                # Pretty-print eigenvalue lists with fixed precision so the
+                # log stays readable.
+                if isinstance(val, list) and val and isinstance(val[0], float):
+                    formatted = "[" + ", ".join(f"{x:.4g}" for x in val) + "]"
+                    lines.append(f"{key}: {formatted}")
+                else:
+                    lines.append(f"{key}: {val}")
 
     lines += [
         "",

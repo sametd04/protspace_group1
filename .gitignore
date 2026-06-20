@@ -10,6 +10,7 @@
 
 # Project-specific
 /docs/publication
+/output/
 
 # --- generated artifacts (outside data/) ---
 **/pdb/
@@ -22,6 +23,7 @@
 
 # Never commit benchmark outputs
 **/metrics.csv
+**/*.pargquet
 **/*.parquetbundle
 
 # Python bytecode

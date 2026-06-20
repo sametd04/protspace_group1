@@ -13,11 +13,26 @@ UMAP_NAME = "umap"
 PACMAP_NAME = "pacmap"
 MDS_NAME = "mds"
 LOCALMAP_NAME = "localmap"
+PPCA_NAME = "ppca"
 
-REDUCER_METHODS = [PCA_NAME, TSNE_NAME, UMAP_NAME, PACMAP_NAME, MDS_NAME, LOCALMAP_NAME]
+REDUCER_METHODS = [
+    PCA_NAME,
+    TSNE_NAME,
+    UMAP_NAME,
+    PACMAP_NAME,
+    MDS_NAME,
+    LOCALMAP_NAME,
+    PPCA_NAME,
+]
 
 # Metric types
 METRIC_TYPES = Literal["euclidean", "cosine"]
+
+# ρPCA background selection strategies.
+# "external" is selected automatically when a background dataset is provided
+# via --ppca-background; the other three are auto-split policies on the
+# target data and are useful when no external background exists.
+BACKGROUND_STRATEGY_TYPES = Literal["external", "random", "uniform", "outlier"]
 
 
 @dataclass(frozen=True)
@@ -38,6 +53,21 @@ class DimensionReductionConfig:
         max_iter: Maximum iterations (>0)
         eps: Convergence tolerance (>0)
         random_state: Random seed for reproducibility (>= 0)
+        regularization_mu: Tikhonov μ added to Σ_B before solving the
+            ρPCA generalized eigenproblem (>= 0). Required (> 0) whenever
+            n_background <= n_features.
+        background_ratio: Fraction of target samples drawn as background
+            in auto-split modes. Ignored when background_strategy =
+            "external". Must lie strictly in (0, 1).
+        background_strategy: Background construction policy.
+            "external" uses the dataset passed via background_data (set by
+            the pipeline from --ppca-background); the auto-split policies
+            "random", "uniform", "outlier" partition the target data.
+        standard_scale: If True, per-set standard-scale (column mean 0,
+            unit variance) target and background matrices before computing
+            covariances. Matches the Carilli/Jackson/Pachter convention.
+            Strongly recommended for PLM embeddings whose dimensions have
+            heterogeneous scale.
     """
 
     n_components: int = field(default=2, metadata={"allowed": [2, 3]})
@@ -56,6 +86,15 @@ class DimensionReductionConfig:
     eps: float = field(default=1e-3, metadata={"gt": 0})
     random_state: int = field(default=42, metadata={"gte": 0})
 
+    # ρPCA-specific parameters
+    regularization_mu: float = field(default=1e-3, metadata={"gte": 0})
+    background_ratio: float = field(default=0.3, metadata={"gt": 0, "lt": 1})
+    background_strategy: BACKGROUND_STRATEGY_TYPES = field(
+        default="outlier",
+        metadata={"allowed": list(get_args(BACKGROUND_STRATEGY_TYPES))},
+    )
+    standard_scale: bool = field(default=True)
+
     def __post_init__(self):
         """Validate configuration parameters."""
         for data_field in fields(self):
@@ -67,25 +106,21 @@ class DimensionReductionConfig:
                     raise ValueError(
                         f"{data_field.name} must be one of {metadata['allowed']}"
                     )
-
             if "gt" in metadata:
                 if value <= metadata["gt"]:
                     raise ValueError(
                         f"{data_field.name} must be greater than {metadata['gt']}"
                     )
-
             if "lt" in metadata:
                 if value >= metadata["lt"]:
                     raise ValueError(
                         f"{data_field.name} must be less than {metadata['lt']}"
                     )
-
             if "gte" in metadata:
                 if value < metadata["gte"]:
                     raise ValueError(
                         f"{data_field.name} must be greater than or equal to {metadata['gte']}"
                     )
-
             if "lte" in metadata:
                 if value > metadata["lte"]:
                     raise ValueError(

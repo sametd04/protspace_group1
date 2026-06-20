@@ -22,7 +22,7 @@ from protspace.data.loaders.embedding_set import (
 )
 from protspace.data.processors.base_processor import BaseProcessor
 from protspace.utils import get_reducers
-from protspace.utils.constants import MDS_NAME
+from protspace.utils.constants import MDS_NAME, PPCA_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -43,14 +43,23 @@ class ReducerParams:
     max_iter: int = 300
     eps: float = 1e-6
 
+    # ρPCA-specific parameters
+    regularization_mu: float = 1e-3
+    background_ratio: float = 0.3
+    background_strategy: str = "outlier"
+    standard_scale: bool = True
+    # Path to external background HDF5. When set, takes precedence over
+    # background_strategy and forces strategy="external" in the reducer.
+    background_path: str = ""
+
 
 @dataclass(frozen=True)
 class MethodSpec:
     """A single DR method with its dimension count and parameter overrides."""
 
-    method: str  # e.g. "umap"
-    dims: int  # e.g. 2
-    overrides: tuple[tuple[str, int | float | str], ...] = ()
+    method: str
+    dims: int
+    overrides: tuple[tuple[str, int | float | str | bool], ...] = ()
 
     def __str__(self) -> str:
         base = f"{self.method}{self.dims}"
@@ -60,7 +69,7 @@ class MethodSpec:
         return base
 
     @property
-    def overrides_dict(self) -> dict[str, int | float | str]:
+    def overrides_dict(self) -> dict[str, int | float | str | bool]:
         return dict(self.overrides)
 
 
@@ -81,13 +90,19 @@ class PipelineConfig:
 
 # Valid override parameter names (from ReducerParams fields)
 _VALID_OVERRIDE_KEYS = {f.name for f in fields(ReducerParams)}
-# Field types for coercion
 _FIELD_TYPES = {f.name: f.type for f in fields(ReducerParams)}
 
 
-def _coerce_value(key: str, raw: str) -> int | float | str:
+def _coerce_value(key: str, raw: str) -> int | float | str | bool:
     """Coerce a string value to the appropriate type for the given parameter."""
     expected = _FIELD_TYPES.get(key)
+    if expected is bool:
+        # Accept "true"/"false"/"1"/"0" case-insensitively.
+        if raw.lower() in ("true", "1", "yes"):
+            return True
+        if raw.lower() in ("false", "0", "no"):
+            return False
+        raise ValueError(f"Invalid boolean value {raw!r} for {key!r}")
     if expected is int:
         return int(raw)
     if expected is float:
@@ -96,13 +111,7 @@ def _coerce_value(key: str, raw: str) -> int | float | str:
 
 
 def parse_method_spec(method_spec: str) -> MethodSpec:
-    """Parse a method spec string into a MethodSpec.
-
-    Examples:
-        'pca2'                              → MethodSpec('pca', 2)
-        'umap2:n_neighbors=50;min_dist=0.1' → MethodSpec('umap', 2, overrides=...)
-    """
-    # Split on first ':' to separate method from overrides
+    """Parse a method spec string into a MethodSpec."""
     if ":" in method_spec:
         base, params_str = method_spec.split(":", 1)
     else:
@@ -139,11 +148,7 @@ def parse_method_spec(method_spec: str) -> MethodSpec:
 
 
 def parse_methods_arg(raw: list[str]) -> list[MethodSpec]:
-    """Parse repeatable -m arguments into a deduplicated MethodSpec list.
-
-    Each element may be comma-separated: "pca2,umap2:n_neighbors=50"
-    Semicolons separate parameters within a method override.
-    """
+    """Parse repeatable -m arguments into a deduplicated MethodSpec list."""
     specs: list[MethodSpec] = []
     seen: set[MethodSpec] = set()
     for item in raw:
@@ -159,16 +164,7 @@ def parse_methods_arg(raw: list[str]) -> list[MethodSpec]:
 
 
 def disambiguation_suffix(spec: MethodSpec, method_counts: Counter) -> str:
-    """Return a parameter suffix for projection name disambiguation.
-
-    When the same (method, dims) pair appears multiple times in a run AND the
-    given spec carries parameter overrides, return the abbreviated parameter
-    string (e.g. "n=50, d=0.1"). Otherwise return "".
-
-    A plain spec sitting alongside an override spec returns "" — the override
-    spec alone carries the disambiguating suffix, and the plain spec keeps the
-    default name (e.g. "ProtT5 — UMAP 2").
-    """
+    """Return a parameter suffix for projection name disambiguation."""
     if method_counts[(spec.method, spec.dims)] > 1 and spec.overrides:
         return format_param_suffix(spec.overrides_dict)
     return ""
@@ -181,12 +177,7 @@ def _run_with_overridden_config(
     dims: int,
     data: Any,
 ) -> dict[str, Any]:
-    """Run base.process_reduction with effective_params, restoring the prior
-    base.config afterwards.
-
-    Centralizes the save/restore pattern so a leaked `precomputed` flag (or
-    any other temporary key) cannot survive across reduction calls.
-    """
+    """Run base.process_reduction with effective_params, restoring base.config after."""
     saved = base.config
     base.config = effective_params
     try:
@@ -195,49 +186,52 @@ def _run_with_overridden_config(
         base.config = saved
 
 
-class ReductionPipeline:
-    """Unified pipeline: load → annotate → reduce → output.
+def _load_background_h5(path: Path) -> np.ndarray:
+    """Load all embedding vectors from an HDF5 file as a (n, d) ndarray.
 
-    This class orchestrates the full data preparation workflow, replacing
-    both LocalProcessor and UniProtQueryProcessor with a single composable
-    pipeline that works with any input source via EmbeddingSet.
+    Identifier ordering is not preserved — only the vector matrix is needed
+    for ρPCA's covariance computation.
     """
+    from protspace.data.loaders import load_h5
+
+    emb_set = load_h5([path])
+    arr = np.asarray(emb_set.data, dtype=np.float64)
+    logger.info(
+        "Loaded ρPCA background: %d samples × %d features from %s",
+        arr.shape[0],
+        arr.shape[1],
+        path,
+    )
+    return arr
+
+
+class ReductionPipeline:
+    """Unified pipeline: load → annotate → reduce → output."""
 
     def __init__(self, config: PipelineConfig):
         self.config = config
         reducer_dict = asdict(config.reducer_params)
         self.base = BaseProcessor(reducer_dict, get_reducers())
+        # Lazy cache for external ρPCA backgrounds, keyed by absolute path.
+        # This supports both global --ppca-background and per-method
+        # background_path overrides in method specs.
+        self._background_cache: dict[str, np.ndarray] = {}
 
     def run(self, embedding_sets: list[EmbeddingSet]) -> Path:
-        """Execute the full pipeline.
-
-        Args:
-            embedding_sets: One or more EmbeddingSets to process.
-
-        Returns:
-            Path to the output file/directory.
-        """
         if not embedding_sets:
             raise ValueError("At least one EmbeddingSet is required.")
 
-        # Merge same-name embedding sets (union their proteins)
         from protspace.data.loaders.embedding_set import merge_same_name_sets
 
         embedding_sets = merge_same_name_sets(embedding_sets)
-
-        # Validate all sets share the same headers (or compute intersection)
         all_headers = self._validate_headers(embedding_sets)
-
-        # Fetch annotations (pass embedding sets so FASTA sequences can be reused)
         metadata = self._fetch_annotations(all_headers, embedding_sets)
 
-        # Apply score stripping
         if self.config.no_scores:
             from protspace.data.annotations.scores import strip_scores_from_df
 
             metadata = strip_scores_from_df(metadata)
 
-        # Build full metadata with all headers
         full_metadata = pd.DataFrame({"identifier": all_headers})
         if len(metadata.columns) > 1:
             metadata = metadata.astype(str)
@@ -251,10 +245,8 @@ class ReductionPipeline:
             )
         metadata = full_metadata
 
-        # DR: each embedding set × each method
         all_reductions = self._run_reductions(embedding_sets)
 
-        # Create and save output
         output = self.base.create_output(metadata, all_reductions, all_headers)
         self.base.save_output(
             output, self.config.output_path, bundled=self.config.bundled
@@ -267,7 +259,6 @@ class ReductionPipeline:
         )
         logger.info(f"Output saved to: {self.config.output_path}")
 
-        # Clean up intermediate dir if not keeping
         if (
             not self.config.keep_tmp
             and self.config.intermediate_dir
@@ -279,7 +270,6 @@ class ReductionPipeline:
 
     @staticmethod
     def _extract_sequences(embedding_sets: list[EmbeddingSet]) -> dict[str, str]:
-        """Extract protein sequences from FASTA files referenced by embedding sets."""
         sequences = {}
         for emb_set in embedding_sets:
             if emb_set.fasta_path and Path(emb_set.fasta_path).exists():
@@ -291,10 +281,6 @@ class ReductionPipeline:
         return sequences
 
     def _validate_headers(self, embedding_sets: list[EmbeddingSet]) -> list[str]:
-        """Ensure all embedding sets share the same identifiers.
-
-        If they differ, compute intersection and warn.
-        """
         if len(embedding_sets) == 1:
             return embedding_sets[0].headers
 
@@ -308,7 +294,6 @@ class ReductionPipeline:
                 "No common protein identifiers found across embedding sets."
             )
 
-        # Check if any set lost identifiers
         for es in embedding_sets:
             diff = set(es.headers) - common
             if diff:
@@ -317,10 +302,8 @@ class ReductionPipeline:
                     f"not present in all sets."
                 )
 
-        # Use the order from the first set, filtered to common
         common_headers = [h for h in embedding_sets[0].headers if h in common]
 
-        # Re-order data in each set to match common_headers
         for es in embedding_sets:
             if es.headers != common_headers:
                 idx_map = {h: i for i, h in enumerate(es.headers)}
@@ -333,15 +316,12 @@ class ReductionPipeline:
     def _fetch_annotations(
         self, headers: list[str], embedding_sets: list[EmbeddingSet] = None
     ) -> pd.DataFrame:
-        """Fetch annotations from APIs with incremental caching support."""
         from protspace.data.annotations.manager import ProteinAnnotationManager
 
-        # Extract sequences from FASTA files (if available) to avoid re-fetching
         sequences = self._extract_sequences(embedding_sets) if embedding_sets else {}
 
         annotation_names, csv_path = self._resolve_annotation_names()
 
-        # Load user CSV if provided
         csv_df = None
         if csv_path:
             logger.info(f"Loading custom annotations from: {csv_path}")
@@ -364,7 +344,6 @@ class ReductionPipeline:
         else:
             annotations_list = None
 
-        # CSV-only: no API annotations requested
         if annotations_list is None and csv_df is not None:
             return csv_df
 
@@ -403,7 +382,6 @@ class ReductionPipeline:
                     else:
                         api_df = cached_df
 
-                    # Warn if cached annotations are all empty
                     data_cols = [c for c in api_df.columns if c != "identifier"]
                     if data_cols:
                         non_empty = api_df[data_cols].apply(
@@ -428,12 +406,9 @@ class ReductionPipeline:
                 )
 
                 if refetching_annotations:
-                    # Override with explicitly requested sources
                     sources = {src: src in refetch for src in _ANN_SOURCES}
                     refetched = [s for s in _ANN_SOURCES if sources[s]]
                     logger.info(f"--refetch: re-fetching {', '.join(refetched)}")
-                    # Drop cached columns for refetched sources so manager
-                    # re-fetches them
                     from protspace.data.annotations.configuration import (
                         AnnotationConfiguration as AnnCfg,
                     )
@@ -477,11 +452,6 @@ class ReductionPipeline:
             return self._merge_csv(api_df, csv_df)
 
     def _resolve_annotation_names(self) -> tuple[list[str], str | None]:
-        """Parse annotation arguments into annotation names and optional CSV path.
-
-        Returns:
-            Tuple of (annotation_names, csv_path_or_None)
-        """
         if not self.config.annotations:
             return [], None
 
@@ -502,7 +472,6 @@ class ReductionPipeline:
 
     @staticmethod
     def _merge_csv(api_df: pd.DataFrame, csv_df: pd.DataFrame | None) -> pd.DataFrame:
-        """Merge user CSV annotations onto API annotations. CSV wins on collision."""
         if csv_df is None:
             return api_df
 
@@ -512,7 +481,6 @@ class ReductionPipeline:
             how="left",
             suffixes=("_api", ""),
         )
-        # Drop API-suffixed duplicates so CSV values win
         for col in list(merged.columns):
             if col.endswith("_api"):
                 base = col.removesuffix("_api")
@@ -534,11 +502,16 @@ class ReductionPipeline:
         cache_dir = self.config.intermediate_dir
         if not cache_dir or not self.config.keep_tmp:
             return None
+        # Exclude transient state (the loaded background array) from the
+        # cache key — the path is already in effective_params.
+        params_for_key = {
+            k: v for k, v in (effective_params or {}).items() if k != "background_data"
+        } or asdict(self.config.reducer_params)
         key_dict = {
             "embedding": embedding_name,
             "method": method,
             "dims": dims,
-            "params": effective_params or asdict(self.config.reducer_params),
+            "params": params_for_key,
         }
         key_json = json.dumps(key_dict, sort_keys=True, default=str)
         h = hashlib.sha256(key_json.encode()).hexdigest()[:12]
@@ -593,22 +566,62 @@ class ReductionPipeline:
             path, data=reduction["data"], info=np.array(json.dumps(reduction["info"]))
         )
 
+    # --- ρPCA background loading ---
+
+    def _get_background_data(self, path_str: str) -> np.ndarray | None:
+        """Load an external ρPCA background (cached by path)."""
+        if not path_str:
+            return None
+        key = str(Path(path_str).expanduser().resolve())
+        if key not in self._background_cache:
+            self._background_cache[key] = _load_background_h5(Path(path_str))
+        return self._background_cache[key]
+
+    def _prepare_ppca_params(
+        self, effective_params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Resolve ρPCA-specific knobs in the effective params.
+
+        If background_path is set (either globally or as a per-method
+        override), force strategy="external" and load the background.
+        Otherwise leave the auto-split strategy in place and emit a warning
+        on first use.
+        """
+        params = dict(effective_params)
+        path_str = params.get("background_path", "") or ""
+        if path_str:
+            params["background_strategy"] = "external"
+            params["background_data"] = self._get_background_data(path_str)
+        elif params.get("background_strategy") not in (
+            "random",
+            "uniform",
+            "outlier",
+        ):
+            # Should not happen via the CLI, but guard the case where a
+            # user manually passes background_strategy=external without a
+            # background_path.
+            params["background_strategy"] = "outlier"
+
+        # background_path is a path string, not a reducer param; drop it.
+        params.pop("background_path", None)
+        return params
+
     # --- Dimensionality reduction ---
 
     def _run_reductions(
         self, embedding_sets: list[EmbeddingSet]
     ) -> list[dict[str, Any]]:
-        """Run dimensionality reduction on all embedding sets."""
         all_reductions = []
-        cached_projections: list[str] = []  # e.g. "PCA 2 (prot_t5)"
+        cached_projections: list[str] = []
         computed_count = 0
 
-        # Pre-compute which (method, dims) pairs appear multiple times
         method_counts = Counter(
             (spec.method, spec.dims) for spec in self.config.methods
         )
 
         global_params = asdict(self.config.reducer_params)
+        ppca_in_run = any(spec.method == PPCA_NAME for spec in self.config.methods)
+        ppca_warned = False
 
         for emb_set in embedding_sets:
             if emb_set.precomputed:
@@ -639,10 +652,25 @@ class ReductionPipeline:
                     logger.warning(f"Unknown method: {method}. Skipping.")
                     continue
 
-                # Merge global defaults with per-method overrides
                 effective_params = {**global_params, **spec.overrides_dict}
 
-                # Build param suffix for disambiguation
+                # ρPCA-specific resolution.
+                if method == PPCA_NAME:
+                    effective_params = self._prepare_ppca_params(effective_params)
+                    has_external = effective_params.get("background_data") is not None
+                    if not has_external and not ppca_warned:
+                        logger.warning(
+                            "ρPCA: no external background provided via "
+                            "--ppca-background; falling back to auto-split "
+                            "strategy '%s' (background_ratio=%.2f). Results "
+                            "are usually inferior to a true contrastive "
+                            "background. Provide a biologically meaningful "
+                            "background dataset for best results.",
+                            effective_params.get("background_strategy"),
+                            effective_params.get("background_ratio", 0.0),
+                        )
+                        ppca_warned = True
+
                 param_suffix = disambiguation_suffix(spec, method_counts)
 
                 cached = self._load_cached_projection(
@@ -675,5 +703,9 @@ class ReductionPipeline:
                 len(cached_projections),
                 "s" if len(cached_projections) != 1 else "",
             )
+
+        # Silence the unused-variable warning; ppca_in_run is informational
+        # and may be used in future logging.
+        _ = ppca_in_run
 
         return all_reductions
