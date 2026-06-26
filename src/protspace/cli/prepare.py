@@ -19,6 +19,7 @@ import typer
 from protspace.cli.app import app, setup_logging
 from protspace.cli.common_options import (
     Metric,
+    NuisanceBlockNormalization,
     Opt_BatchSize,
     Opt_Eps,
     Opt_Fasta,
@@ -27,13 +28,21 @@ from protspace.cli.common_options import (
     Opt_MaxIter,
     Opt_Methods,
     Opt_Metric,
+    Opt_Nuisance,
+    Opt_NuisanceBlockNormalization,
+    Opt_NuisanceCrossFit,
+    Opt_NuisanceRidgeAlpha,
+    Opt_NuisanceWriteBackground,
+    Opt_PpcaBackground,
     Opt_MinDist,
     Opt_MnRatio,
     Opt_NInit,
     Opt_NNeighbors,
     Opt_Perplexity,
     Opt_RandomState,
+    Opt_RegularizationMu,
     Opt_Similarity,
+    Opt_StandardScale,
     Opt_Verbose,
 )
 
@@ -287,6 +296,15 @@ def prepare(
     n_init: Opt_NInit = 4,
     max_iter: Opt_MaxIter = 300,
     eps: Opt_Eps = 1e-3,
+    # ρPCA
+    ppca_background: Opt_PpcaBackground = None,
+    nuisance: Opt_Nuisance = None,
+    regularization_mu: Opt_RegularizationMu = 1e-6,
+    standard_scale: Opt_StandardScale = True,
+    nuisance_ridge_alpha: Opt_NuisanceRidgeAlpha = 10.0,
+    nuisance_cross_fit: Opt_NuisanceCrossFit = 5,
+    nuisance_block_normalization: Opt_NuisanceBlockNormalization = NuisanceBlockNormalization.none,
+    nuisance_write_background: Opt_NuisanceWriteBackground = True,
     # Annotations
     annotations: Opt_Annotations = None,
     scores: Opt_Scores = True,
@@ -319,6 +337,11 @@ def prepare(
     refetch_stages = _parse_refetch(refetch)
     if refetch_stages:
         logger.info(f"Refetching stages: {', '.join(sorted(refetch_stages))}")
+
+    if ppca_background and nuisance:
+        raise typer.BadParameter(
+            "Use either --ppca-background or --nuisance for ρPCA, not both."
+        )
 
     input_specs = _parse_input_specs(input) if input else []
 
@@ -498,6 +521,14 @@ def prepare(
             n_init=n_init,
             max_iter=max_iter,
             eps=eps,
+            regularization_mu=regularization_mu,
+            standard_scale=standard_scale,
+            ppca_background_path=str(ppca_background) if ppca_background else "",
+            nuisance_specs=tuple(nuisance or ()),
+            nuisance_ridge_alpha=nuisance_ridge_alpha,
+            nuisance_cross_fit=nuisance_cross_fit,
+            nuisance_block_normalization=str(getattr(nuisance_block_normalization, "value", nuisance_block_normalization)),
+            nuisance_write_background=nuisance_write_background,
         )
         config = PipelineConfig(
             methods=method_specs,

@@ -16,6 +16,12 @@ class Metric(str, Enum):
     manhattan = "manhattan"
 
 
+class NuisanceBlockNormalization(str, Enum):
+    none = "none"
+    trace = "trace"
+    row_count = "row_count"
+
+
 # ---------------------------------------------------------------------------
 # Shared option types
 # ---------------------------------------------------------------------------
@@ -33,6 +39,7 @@ Opt_Methods = Annotated[
         "--methods",
         help=(
             "DR methods. Comma-sep or repeat: -m pca2,umap2 or -m pca2 -m umap2. "
+            "Includes ppca2/ppca3 when --ppca-background or --nuisance is supplied. "
             "Inline params: -m 'umap2:n_neighbors=50;min_dist=0.1'."
         ),
         rich_help_panel="Projection",
@@ -109,6 +116,85 @@ Opt_MaxIter = Annotated[
 Opt_Eps = Annotated[
     float,
     typer.Option(help="MDS convergence tolerance.", rich_help_panel="Projection"),
+]
+
+# ρPCA options. Only the final clean pathways are exposed:
+#   1. --ppca-background for an already-built explicit background
+#   2. --nuisance for annotation-defined backgrounds inside `prepare`
+Opt_PpcaBackground = Annotated[
+    Path | None,
+    typer.Option(
+        "--ppca-background",
+        help=(
+            "Explicit ρPCA background HDF5. Required for ppca2/ppca3 in "
+            "`project`; optional in `prepare` when --nuisance is supplied."
+        ),
+        rich_help_panel="ρPCA",
+    ),
+]
+Opt_Nuisance = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--nuisance",
+        help=(
+            "Annotation-defined ρPCA nuisance specification. Repeatable. "
+            "Examples: --nuisance 'sp_in_embedding:type=binary;missing=zero;scale=0.5' "
+            "or --nuisance 'length:type=continuous;transform=log1p;basis=spline'. "
+            "Only available in `prepare`, because it needs annotation context."
+        ),
+        rich_help_panel="ρPCA",
+    ),
+]
+Opt_RegularizationMu = Annotated[
+    float,
+    typer.Option(
+        "--regularization-mu",
+        help="Tikhonov regularization μ added to the ρPCA background covariance.",
+        rich_help_panel="ρPCA",
+        min=0.0,
+    ),
+]
+Opt_StandardScale = Annotated[
+    bool,
+    typer.Option(
+        "--standard-scale/--no-standard-scale",
+        help="Column-standardize target/background before the ρPCA eigensolve.",
+        rich_help_panel="ρPCA",
+    ),
+]
+Opt_NuisanceRidgeAlpha = Annotated[
+    float,
+    typer.Option(
+        "--nuisance-ridge-alpha",
+        help="Default ridge α for annotation→embedding nuisance models.",
+        rich_help_panel="ρPCA",
+        min=0.0,
+    ),
+]
+Opt_NuisanceCrossFit = Annotated[
+    int,
+    typer.Option(
+        "--nuisance-cross-fit",
+        help="Default cross-fitting folds for nuisance models. Use 0 or 1 to fit all rows.",
+        rich_help_panel="ρPCA",
+        min=0,
+    ),
+]
+Opt_NuisanceBlockNormalization = Annotated[
+    NuisanceBlockNormalization,
+    typer.Option(
+        "--nuisance-block-normalization",
+        help="Per-nuisance block normalization before signing and stacking.",
+        rich_help_panel="ρPCA",
+    ),
+]
+Opt_NuisanceWriteBackground = Annotated[
+    bool,
+    typer.Option(
+        "--nuisance-write-background/--no-nuisance-write-background",
+        help="Write background.h5, manifest, diagnostics, and effect summary for --nuisance runs.",
+        rich_help_panel="ρPCA",
+    ),
 ]
 
 # Embedding options (shared by prepare and embed)

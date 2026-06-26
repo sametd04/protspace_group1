@@ -13,8 +13,17 @@ UMAP_NAME = "umap"
 PACMAP_NAME = "pacmap"
 MDS_NAME = "mds"
 LOCALMAP_NAME = "localmap"
+PPCA_NAME = "ppca"
 
-REDUCER_METHODS = [PCA_NAME, TSNE_NAME, UMAP_NAME, PACMAP_NAME, MDS_NAME, LOCALMAP_NAME]
+REDUCER_METHODS = [
+    PCA_NAME,
+    TSNE_NAME,
+    UMAP_NAME,
+    PACMAP_NAME,
+    MDS_NAME,
+    LOCALMAP_NAME,
+    PPCA_NAME,
+]
 
 # Metric types
 METRIC_TYPES = Literal["euclidean", "cosine"]
@@ -38,6 +47,8 @@ class DimensionReductionConfig:
         max_iter: Maximum iterations (>0)
         eps: Convergence tolerance (>0)
         random_state: Random seed for reproducibility (>= 0)
+        regularization_mu: Tikhonov regularization added to the ρPCA background covariance
+        standard_scale: Standardize target/background columns before the ρPCA eigensolve
     """
 
     n_components: int = field(default=2, metadata={"allowed": [2, 3]})
@@ -55,6 +66,11 @@ class DimensionReductionConfig:
     max_iter: int = field(default=300, metadata={"gt": 0})
     eps: float = field(default=1e-3, metadata={"gt": 0})
     random_state: int = field(default=42, metadata={"gte": 0})
+
+    # ρPCA parameters. The background itself is attached by the pipeline as a
+    # side channel because it is an ndarray, not a simple CLI scalar.
+    regularization_mu: float = field(default=1e-6, metadata={"gte": 0})
+    standard_scale: bool = field(default=True)
 
     def __post_init__(self):
         """Validate configuration parameters."""

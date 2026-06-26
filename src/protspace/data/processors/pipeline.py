@@ -22,7 +22,7 @@ from protspace.data.loaders.embedding_set import (
 )
 from protspace.data.processors.base_processor import BaseProcessor
 from protspace.utils import get_reducers
-from protspace.utils.constants import MDS_NAME
+from protspace.utils.constants import MDS_NAME, PPCA_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,18 @@ class ReducerParams:
     n_init: int = 4
     max_iter: int = 300
     eps: float = 1e-6
+
+    # ρPCA. Exactly two final pathways are supported:
+    #   --ppca-background: use an existing explicit background HDF5
+    #   --nuisance: build an annotation-defined background inside prepare
+    regularization_mu: float = 1e-6
+    standard_scale: bool = True
+    ppca_background_path: str = ""
+    nuisance_specs: tuple[str, ...] = ()
+    nuisance_ridge_alpha: float = 10.0
+    nuisance_cross_fit: int = 5
+    nuisance_block_normalization: str = "none"
+    nuisance_write_background: bool = True
 
 
 @dataclass(frozen=True)
@@ -195,6 +207,61 @@ def _run_with_overridden_config(
         base.config = saved
 
 
+
+
+def _json_safe_projection_param(value: Any) -> Any:
+    """Return a JSON-safe cache-key representation of projection params."""
+    if isinstance(value, np.ndarray):
+        arr = np.ascontiguousarray(value)
+        h = hashlib.sha256(arr.view(np.uint8)).hexdigest()[:16]
+        return {"ndarray_shape": list(arr.shape), "ndarray_dtype": str(arr.dtype), "sha256": h}
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe_projection_param(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_projection_param(v) for v in value]
+    return value
+
+
+def _cacheable_params(params: dict[str, Any]) -> dict[str, Any]:
+    """Convert params, including ρPCA ndarray side channels, to cache-safe form."""
+    return {str(k): _json_safe_projection_param(v) for k, v in params.items()}
+
+
+def load_ppca_background_h5(path: str | Path) -> tuple[np.ndarray, list[str], dict[str, Any]]:
+    """Load an explicit ρPCA background HDF5 as a matrix.
+
+    The loader intentionally reuses ProtSpace's HDF5 conventions by forcing a
+    name override, so background HDF5 files do not need a `model_name` attribute.
+    """
+    from protspace.data.loaders import load_h5
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"ρPCA background not found: {path}")
+    bg_set = load_h5([path], name_override="ppca_background")
+    B = np.asarray(bg_set.data, dtype=np.float64)
+    if B.ndim != 2:
+        raise ValueError(f"ρPCA background must be 2D, got {B.shape}.")
+    if B.shape[0] < 2:
+        raise ValueError(f"ρPCA background needs at least two rows, got {B.shape[0]}.")
+    if not np.isfinite(B).all():
+        raise ValueError("ρPCA background contains NaN or infinite values.")
+    details = {
+        "mode": "explicit",
+        "background_path": str(path),
+        "n_background": int(B.shape[0]),
+        "n_features": int(B.shape[1]),
+    }
+    return B, list(bg_set.headers), details
+
+
+def _safe_path_component(value: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(value))
+    return safe or "embedding"
+
+
 class ReductionPipeline:
     """Unified pipeline: load → annotate → reduce → output.
 
@@ -207,6 +274,7 @@ class ReductionPipeline:
         self.config = config
         reducer_dict = asdict(config.reducer_params)
         self.base = BaseProcessor(reducer_dict, get_reducers())
+        self._ppca_background_cache: dict[str, tuple[np.ndarray, list[str], dict[str, Any]]] = {}
 
     def run(self, embedding_sets: list[EmbeddingSet]) -> Path:
         """Execute the full pipeline.
@@ -252,7 +320,7 @@ class ReductionPipeline:
         metadata = full_metadata
 
         # DR: each embedding set × each method
-        all_reductions = self._run_reductions(embedding_sets)
+        all_reductions = self._run_reductions(embedding_sets, metadata)
 
         # Create and save output
         output = self.base.create_output(metadata, all_reductions, all_headers)
@@ -538,7 +606,7 @@ class ReductionPipeline:
             "embedding": embedding_name,
             "method": method,
             "dims": dims,
-            "params": effective_params or asdict(self.config.reducer_params),
+            "params": _cacheable_params(effective_params or asdict(self.config.reducer_params)),
         }
         key_json = json.dumps(key_dict, sort_keys=True, default=str)
         h = hashlib.sha256(key_json.encode()).hexdigest()[:12]
@@ -593,10 +661,105 @@ class ReductionPipeline:
             path, data=reduction["data"], info=np.array(json.dumps(reduction["info"]))
         )
 
+    # --- ρPCA background helpers ---
+
+    def _background_output_dir(self, emb_set: EmbeddingSet) -> Path | None:
+        params = self.config.reducer_params
+        if not params.nuisance_write_background:
+            return None
+        base = self.config.intermediate_dir
+        if base is None:
+            base = self.config.output_path if self.config.output_path.suffix == "" else self.config.output_path.parent
+        return base / "ppca_nuisance_backgrounds" / _safe_path_component(emb_set.name)
+
+    def _load_explicit_ppca_background(
+        self, background_path: str
+    ) -> tuple[np.ndarray, list[str], dict[str, Any]]:
+        cache_key = str(Path(background_path).resolve())
+        if cache_key not in self._ppca_background_cache:
+            self._ppca_background_cache[cache_key] = load_ppca_background_h5(background_path)
+        return self._ppca_background_cache[cache_key]
+
+    def _prepare_ppca_params(
+        self,
+        *,
+        emb_set: EmbeddingSet,
+        metadata: pd.DataFrame,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Attach the explicit background matrix required by PPCAReducer."""
+        if emb_set.precomputed:
+            raise ValueError("ρPCA cannot run on precomputed similarity/distance matrices.")
+
+        background_path = str(params.get("ppca_background_path", "") or "")
+        nuisance_specs = tuple(params.get("nuisance_specs", ()) or ())
+
+        if background_path and nuisance_specs:
+            raise ValueError(
+                "ρPCA received both --ppca-background and --nuisance. Choose one "
+                "background source for a given run."
+            )
+
+        if background_path:
+            B, bg_headers, details = self._load_explicit_ppca_background(background_path)
+            if B.shape[1] != emb_set.data.shape[1]:
+                raise ValueError(
+                    f"ρPCA background {background_path!r} has {B.shape[1]} "
+                    f"features but embedding '{emb_set.name}' has "
+                    f"{emb_set.data.shape[1]}. Use the same embedding model."
+                )
+            return {
+                **params,
+                "background_data": B,
+                "background_source": "explicit",
+                "background_n_samples": int(B.shape[0]),
+                "background_details": {
+                    **details,
+                    "background_headers_preview": bg_headers[:10],
+                },
+            }
+
+        if nuisance_specs:
+            from protspace.utils.annotation_nuisance_background import (
+                build_annotation_nuisance_background,
+            )
+
+            result = build_annotation_nuisance_background(
+                ids=list(emb_set.headers),
+                X=np.asarray(emb_set.data, dtype=np.float64),
+                annotations=metadata,
+                nuisance_specs=list(nuisance_specs),
+                ridge_alpha=float(params.get("nuisance_ridge_alpha", 10.0)),
+                cross_fit=int(params.get("nuisance_cross_fit", 5)),
+                random_state=int(params.get("random_state", 42)),
+                block_normalization=str(params.get("nuisance_block_normalization", "none")),
+                target_name=emb_set.name,
+                regularization_mu=float(params.get("regularization_mu", 1e-6)),
+            )
+            out_dir = self._background_output_dir(emb_set)
+            if out_dir is not None:
+                result.write(out_dir)
+                logger.info("Wrote ρPCA nuisance background diagnostics to %s", out_dir)
+
+            return {
+                **params,
+                "background_data": result.background,
+                "background_source": "annotation_nuisance",
+                "background_n_samples": int(result.background.shape[0]),
+                "background_details": result.manifest,
+            }
+
+        raise ValueError(
+            "ρPCA requested but no background source was provided. Use either "
+            "--ppca-background background.h5 or, in protspace prepare, one or more "
+            "--nuisance specifications."
+        )
+
+
     # --- Dimensionality reduction ---
 
     def _run_reductions(
-        self, embedding_sets: list[EmbeddingSet]
+        self, embedding_sets: list[EmbeddingSet], metadata: pd.DataFrame
     ) -> list[dict[str, Any]]:
         """Run dimensionality reduction on all embedding sets."""
         all_reductions = []
@@ -641,6 +804,13 @@ class ReductionPipeline:
 
                 # Merge global defaults with per-method overrides
                 effective_params = {**global_params, **spec.overrides_dict}
+
+                if method == PPCA_NAME:
+                    effective_params = self._prepare_ppca_params(
+                        emb_set=emb_set,
+                        metadata=metadata,
+                        params=effective_params,
+                    )
 
                 # Build param suffix for disambiguation
                 param_suffix = disambiguation_suffix(spec, method_counts)

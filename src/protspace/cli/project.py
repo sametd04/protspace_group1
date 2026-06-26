@@ -16,13 +16,16 @@ from protspace.cli.common_options import (
     Opt_MaxIter,
     Opt_Methods,
     Opt_Metric,
+    Opt_PpcaBackground,
     Opt_MinDist,
     Opt_MnRatio,
     Opt_NInit,
     Opt_NNeighbors,
     Opt_Perplexity,
     Opt_RandomState,
+    Opt_RegularizationMu,
     Opt_Similarity,
+    Opt_StandardScale,
     Opt_Verbose,
 )
 
@@ -59,6 +62,9 @@ def project(
     n_init: Opt_NInit = 4,
     max_iter: Opt_MaxIter = 300,
     eps: Opt_Eps = 1e-3,
+    ppca_background: Opt_PpcaBackground = None,
+    regularization_mu: Opt_RegularizationMu = 1e-6,
+    standard_scale: Opt_StandardScale = True,
     verbose: Opt_Verbose = 0,
 ) -> None:
     """Run dimensionality reduction on HDF5 embeddings.
@@ -80,11 +86,12 @@ def project(
     from protspace.data.processors.pipeline import (
         ReducerParams,
         _run_with_overridden_config,
+        load_ppca_background_h5,
         disambiguation_suffix,
         parse_methods_arg,
     )
     from protspace.utils import get_reducers
-    from protspace.utils.constants import MDS_NAME
+    from protspace.utils.constants import MDS_NAME, PPCA_NAME
 
     input_specs = _parse_input_specs(input)
     embedding_sets: list[EmbeddingSet] = []
@@ -117,6 +124,9 @@ def project(
         n_init=n_init,
         max_iter=max_iter,
         eps=eps,
+        regularization_mu=regularization_mu,
+        standard_scale=standard_scale,
+        ppca_background_path=str(ppca_background) if ppca_background else "",
     )
     global_params = asdict(reducer_params)
     reducers = get_reducers()
@@ -127,6 +137,15 @@ def project(
 
     all_reductions = []
     headers = embedding_sets[0].headers
+    ppca_background_cache = None
+    if any(spec.method == PPCA_NAME for spec in method_specs):
+        if ppca_background is None:
+            raise typer.BadParameter(
+                "protspace project needs --ppca-background when ppca2/ppca3 is requested. "
+                "Use protspace prepare with --nuisance for annotation-defined backgrounds."
+            )
+        ppca_background_cache = load_ppca_background_h5(ppca_background)
+
     for emb_set in embedding_sets:
         for spec in method_specs:
             method, dims = spec.method, spec.dims
@@ -142,6 +161,33 @@ def project(
             effective_params = {**global_params, **spec.overrides_dict}
             if emb_set.precomputed:
                 effective_params["precomputed"] = True
+
+            if method == PPCA_NAME:
+                if emb_set.precomputed:
+                    logger.warning(
+                        "Skipping ρPCA for '%s' because it is a precomputed matrix.",
+                        emb_set.name,
+                    )
+                    continue
+                assert ppca_background_cache is not None
+                B, bg_headers, details = ppca_background_cache
+                if B.shape[1] != emb_set.data.shape[1]:
+                    raise typer.BadParameter(
+                        f"ρPCA background has {B.shape[1]} features but embedding "
+                        f"'{emb_set.name}' has {emb_set.data.shape[1]}. Use the same "
+                        "embedding model for target and background."
+                    )
+                effective_params.update(
+                    {
+                        "background_data": B,
+                        "background_source": "explicit",
+                        "background_n_samples": int(B.shape[0]),
+                        "background_details": {
+                            **details,
+                            "background_headers_preview": bg_headers[:10],
+                        },
+                    }
+                )
 
             logger.info(f"Applying {method.upper()}{dims} to '{emb_set.name}'")
             reduction = _run_with_overridden_config(
