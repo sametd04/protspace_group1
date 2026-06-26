@@ -48,7 +48,7 @@ class DimensionReductionConfig:
         eps: Convergence tolerance (>0)
         random_state: Random seed for reproducibility (>= 0)
         regularization_mu: Tikhonov regularization added to the ρPCA background covariance
-        standard_scale: Standardize target/background columns before the ρPCA eigensolve
+        standard_scale: Standardize target/background columns before the ρPCA eigensolve. Defaults to False for ρPCA.
     """
 
     n_components: int = field(default=2, metadata={"allowed": [2, 3]})
@@ -70,7 +70,7 @@ class DimensionReductionConfig:
     # ρPCA parameters. The background itself is attached by the pipeline as a
     # side channel because it is an ndarray, not a simple CLI scalar.
     regularization_mu: float = field(default=1e-6, metadata={"gte": 0})
-    standard_scale: bool = field(default=True)
+    standard_scale: bool = field(default=False)
 
     def __post_init__(self):
         """Validate configuration parameters."""

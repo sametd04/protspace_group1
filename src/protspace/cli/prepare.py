@@ -300,7 +300,7 @@ def prepare(
     ppca_background: Opt_PpcaBackground = None,
     nuisance: Opt_Nuisance = None,
     regularization_mu: Opt_RegularizationMu = 1e-6,
-    standard_scale: Opt_StandardScale = True,
+    standard_scale: Opt_StandardScale = False,
     nuisance_ridge_alpha: Opt_NuisanceRidgeAlpha = 10.0,
     nuisance_cross_fit: Opt_NuisanceCrossFit = 5,
     nuisance_block_normalization: Opt_NuisanceBlockNormalization = NuisanceBlockNormalization.none,

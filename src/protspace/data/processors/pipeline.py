@@ -47,7 +47,7 @@ class ReducerParams:
     #   --ppca-background: use an existing explicit background HDF5
     #   --nuisance: build an annotation-defined background inside prepare
     regularization_mu: float = 1e-6
-    standard_scale: bool = True
+    standard_scale: bool = False
     ppca_background_path: str = ""
     nuisance_specs: tuple[str, ...] = ()
     nuisance_ridge_alpha: float = 10.0

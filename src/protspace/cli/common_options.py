@@ -158,7 +158,10 @@ Opt_StandardScale = Annotated[
     bool,
     typer.Option(
         "--standard-scale/--no-standard-scale",
-        help="Column-standardize target/background before the ρPCA eigensolve.",
+        help=(
+            "Column-standardize target/background before the ρPCA eigensolve. "
+            "Default is no standard scaling for ρPCA."
+        ),
         rich_help_panel="ρPCA",
     ),
 ]

@@ -64,7 +64,7 @@ def project(
     eps: Opt_Eps = 1e-3,
     ppca_background: Opt_PpcaBackground = None,
     regularization_mu: Opt_RegularizationMu = 1e-6,
-    standard_scale: Opt_StandardScale = True,
+    standard_scale: Opt_StandardScale = False,
     verbose: Opt_Verbose = 0,
 ) -> None:
     """Run dimensionality reduction on HDF5 embeddings.
