@@ -680,15 +680,6 @@ def _write_run_log(
         logger.warning(f"Could not write run log to {log_path}")
 """protspace prepare — unified data preparation pipeline."""
 
-from __future__ import annotations
-
-import logging
-import sys
-import time
-from dataclasses import asdict
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
 
 if TYPE_CHECKING:
     from protspace.data.embedding.biocentral import EmbedConfig
