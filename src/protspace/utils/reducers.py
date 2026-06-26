@@ -15,6 +15,7 @@ from protspace.utils.constants import (  # noqa: F401
     METRIC_TYPES,
     PACMAP_NAME,
     PCA_NAME,
+    PPCA_NAME,
     REDUCER_METHODS,
     TSNE_NAME,
     UMAP_NAME,
@@ -377,3 +378,245 @@ class MDSReducer(DimensionReducer):
             "eps": self.config.eps,
             "random_state": self.config.random_state,
         }
+
+
+# =============================================================================
+# ρPCA reducer
+# =============================================================================
+
+
+def _solve_rho_eigenproblem(
+    sigma_target: np.ndarray,
+    sigma_background: np.ndarray,
+    n_components: int,
+    regularization_mu: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Solve Σ_T v = λ(Σ_B + μI)v and return the top eigenpairs."""
+    from scipy.linalg import LinAlgError, eigh
+
+    if sigma_target.ndim != 2 or sigma_background.ndim != 2:
+        raise ValueError("ρPCA covariances must be 2D matrices.")
+    if sigma_target.shape[0] != sigma_target.shape[1]:
+        raise ValueError(f"Σ_T must be square, got {sigma_target.shape}.")
+    if sigma_background.shape[0] != sigma_background.shape[1]:
+        raise ValueError(f"Σ_B must be square, got {sigma_background.shape}.")
+    if sigma_target.shape != sigma_background.shape:
+        raise ValueError(
+            f"Σ_T shape {sigma_target.shape} and Σ_B shape "
+            f"{sigma_background.shape} differ."
+        )
+
+    d = sigma_background.shape[0]
+    sigma_background_reg = sigma_background.astype(np.float64, copy=True)
+    if regularization_mu > 0.0:
+        sigma_background_reg += float(regularization_mu) * np.eye(d, dtype=np.float64)
+
+    try:
+        eigenvalues, eigenvectors = eigh(sigma_target, sigma_background_reg)
+    except LinAlgError as err:
+        raise LinAlgError(
+            "ρPCA generalized eigenproblem failed: Σ_B is not positive "
+            "definite even after Tikhonov regularization. Increase "
+            f"regularization_mu (currently {regularization_mu}). "
+            f"Original error: {err}"
+        ) from err
+
+    # Covariance matrices are PSD in theory, but generalized eigensolvers may
+    # produce tiny negative round-off values. Keep finite, numerically non-negative
+    # eigenpairs and sort descending by contrastive ratio.
+    tol = 1e-12
+    valid = np.isfinite(eigenvalues) & (eigenvalues > -tol)
+    eigenvalues = np.maximum(eigenvalues[valid], 0.0)
+    eigenvectors = eigenvectors[:, valid]
+    order = np.argsort(eigenvalues)[::-1]
+    eigenvalues = eigenvalues[order]
+    eigenvectors = eigenvectors[:, order]
+
+    if eigenvalues.size < n_components:
+        raise ValueError(
+            f"ρPCA produced only {eigenvalues.size} finite non-negative "
+            f"generalized eigenvalues, but n_components={n_components} was "
+            "requested. Increase regularization_mu, use a larger/non-degenerate "
+            "background set, or request fewer components."
+        )
+
+    top_eigvals = eigenvalues[:n_components]
+    top_eigvecs = eigenvectors[:, :n_components]
+
+    # Deterministic sign convention.
+    for k in range(top_eigvecs.shape[1]):
+        j = int(np.argmax(np.abs(top_eigvecs[:, k])))
+        if top_eigvecs[j, k] < 0:
+            top_eigvecs[:, k] = -top_eigvecs[:, k]
+
+    return top_eigvals, top_eigvecs
+
+
+def _standard_scale_columns(X: np.ndarray) -> np.ndarray:
+    """Column-center and variance-scale a matrix; constant columns remain zero."""
+    mean = X.mean(axis=0, keepdims=True)
+    centered = X - mean
+    std = centered.std(axis=0, keepdims=True, ddof=1)
+    std_safe = np.where(std < 1e-12, 1.0, std)
+    return centered / std_safe
+
+
+def _sample_covariance(centered: np.ndarray) -> np.ndarray:
+    """Bessel-corrected sample covariance of an already-centered matrix."""
+    n = centered.shape[0]
+    if n < 2:
+        raise ValueError(f"Need at least 2 samples to compute covariance, got {n}.")
+    cov = (centered.T @ centered) / (n - 1)
+    return 0.5 * (cov + cov.T)
+
+
+def _project_full_input(
+    data: np.ndarray,
+    X_target: np.ndarray,
+    top_eigvecs: np.ndarray,
+    standard_scale: bool,
+) -> np.ndarray:
+    """Project all displayed rows into the target-space coordinate frame."""
+    target_mean = X_target.mean(axis=0, keepdims=True)
+    if standard_scale:
+        target_std = X_target.std(axis=0, keepdims=True, ddof=1)
+        target_std_safe = np.where(target_std < 1e-12, 1.0, target_std)
+        data_projected = (data - target_mean) / target_std_safe
+    else:
+        data_projected = data - target_mean
+    return (data_projected @ top_eigvecs).astype(np.float64)
+
+
+class PPCAReducer(DimensionReducer):
+    """ρPCA via a generalized eigenproblem with an explicit background.
+
+    The reducer is deliberately small and mathematical: it receives the target
+    embedding matrix plus a prepared ``background_data`` ndarray attached by the
+    pipeline or project command. It does not fetch annotations and it does not
+    construct nuisance backgrounds itself.
+    """
+
+    def fit_transform(self, data: np.ndarray) -> np.ndarray:
+        cfg = self.config
+        data = np.asarray(data, dtype=np.float64)
+        if data.ndim != 2:
+            raise ValueError(f"ρPCA expects 2D input, got shape {data.shape}.")
+
+        n_samples, n_features = data.shape
+        n_components = int(cfg.n_components)
+        if n_components not in {2, 3}:
+            raise ValueError(f"ρPCA supports 2 or 3 components, got {n_components}.")
+        if n_components > n_features:
+            raise ValueError(
+                f"n_components={n_components} > n_features={n_features}."
+            )
+        if n_samples < 2:
+            raise ValueError(
+                f"ρPCA input has {n_samples} sample(s); need at least 2."
+            )
+
+        X_target, X_background, bg_source = self._resolve_target_background(data, cfg)
+
+        if X_target.shape[0] < 2:
+            raise ValueError(
+                f"ρPCA target has {X_target.shape[0]} sample(s); need at least 2 "
+                "to estimate a covariance matrix."
+            )
+        if X_background.shape[0] < 2:
+            raise ValueError(
+                f"ρPCA background has {X_background.shape[0]} sample(s); need "
+                "at least 2 to estimate a covariance matrix."
+            )
+
+        standard_scale = bool(cfg.standard_scale)
+        if standard_scale:
+            X_target_p = _standard_scale_columns(X_target)
+            X_background_p = _standard_scale_columns(X_background)
+        else:
+            X_target_p = X_target - X_target.mean(axis=0, keepdims=True)
+            X_background_p = X_background - X_background.mean(axis=0, keepdims=True)
+
+        sigma_target = _sample_covariance(X_target_p)
+        sigma_background = _sample_covariance(X_background_p)
+
+        try:
+            top_eigvals, top_eigvecs = _solve_rho_eigenproblem(
+                sigma_target=sigma_target,
+                sigma_background=sigma_background,
+                n_components=n_components,
+                regularization_mu=float(cfg.regularization_mu),
+            )
+        except np.linalg.LinAlgError as err:
+            deficiency = max(0, n_features - X_background.shape[0] + 1)
+            raise type(err)(
+                f"{err}\n  n_background={X_background.shape[0]}, "
+                f"n_features={n_features}, deficiency ≥ {deficiency}. "
+                "Try a larger regularization_mu or more background samples."
+            ) from err
+
+        self.eigenvalues_ = top_eigvals
+        self.eigenvectors_ = top_eigvecs
+        self.background_source_ = bg_source
+        self.n_background_samples_ = int(X_background.shape[0])
+
+        return _project_full_input(
+            data=data,
+            X_target=X_target,
+            top_eigvecs=top_eigvecs,
+            standard_scale=standard_scale,
+        )
+
+    def _resolve_target_background(self, data: np.ndarray, cfg) -> tuple[np.ndarray, np.ndarray, str]:
+        background_data = getattr(cfg, "background_data", None)
+        if background_data is None:
+            raise ValueError(
+                "ρPCA requires a background. Provide --ppca-background or use "
+                "protspace prepare with --nuisance."
+            )
+
+        X_background = np.asarray(background_data, dtype=np.float64)
+        if X_background.ndim != 2:
+            raise ValueError(f"ρPCA background must be 2D, got {X_background.shape}.")
+        if X_background.shape[1] != data.shape[1]:
+            raise ValueError(
+                f"ρPCA background has {X_background.shape[1]} features but input "
+                f"has {data.shape[1]}. Use the same embedding model for target "
+                "and background."
+            )
+        if not np.isfinite(X_background).all():
+            raise ValueError("ρPCA background contains NaN or infinite values.")
+
+        target_data = getattr(cfg, "target_data", None)
+        if target_data is not None:
+            X_target = np.asarray(target_data, dtype=np.float64)
+            if X_target.ndim != 2 or X_target.shape[1] != data.shape[1]:
+                raise ValueError(
+                    f"ρPCA target_data shape {X_target.shape} is incompatible "
+                    f"with input shape {data.shape}."
+                )
+            if not np.isfinite(X_target).all():
+                raise ValueError("ρPCA target_data contains NaN or infinite values.")
+        else:
+            X_target = data
+
+        source = str(getattr(cfg, "background_source", "external"))
+        return X_target, X_background, source
+
+    def get_params(self) -> dict[str, Any]:
+        cfg = self.config
+        params: dict[str, Any] = {
+            "n_components": int(cfg.n_components),
+            "random_state": int(cfg.random_state),
+            "regularization_mu": float(cfg.regularization_mu),
+            "standard_scale": bool(cfg.standard_scale),
+        }
+        if hasattr(self, "background_source_"):
+            params["background_source"] = self.background_source_
+        if hasattr(self, "n_background_samples_"):
+            params["n_background_samples"] = self.n_background_samples_
+        if hasattr(self, "eigenvalues_"):
+            params["eigenvalue_ratios"] = self.eigenvalues_.tolist()
+        details = getattr(cfg, "background_details", None)
+        if details:
+            params["background_details"] = details
+        return params

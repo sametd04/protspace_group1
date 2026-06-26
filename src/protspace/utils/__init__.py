@@ -17,12 +17,14 @@ def get_reducers() -> dict:
             MDS_NAME,
             PACMAP_NAME,
             PCA_NAME,
+            PPCA_NAME,
             TSNE_NAME,
             UMAP_NAME,
             LocalMAPReducer,
             MDSReducer,
             PaCMAPReducer,
             PCAReducer,
+            PPCAReducer,
             TSNEReducer,
             UMAPReducer,
         )
@@ -34,6 +36,7 @@ def get_reducers() -> dict:
             PACMAP_NAME: PaCMAPReducer,
             MDS_NAME: MDSReducer,
             LOCALMAP_NAME: LocalMAPReducer,
+            PPCA_NAME: PPCAReducer,
         }
     return _REDUCERS
 
@@ -51,6 +54,7 @@ def __getattr__(name: str):
         "DimensionReductionConfig",
         "REDUCER_METHODS",
         "PCA_NAME",
+        "PPCA_NAME",
         "TSNE_NAME",
         "UMAP_NAME",
         "PACMAP_NAME",
@@ -77,6 +81,7 @@ def __dir__():
         "REDUCER_METHODS",
         "REDUCERS",
         "PCA_NAME",
+        "PPCA_NAME",
         "TSNE_NAME",
         "UMAP_NAME",
         "PACMAP_NAME",

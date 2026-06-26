@@ -35,6 +35,7 @@ METHOD_DISPLAY_NAMES: dict[str, str] = {
     "pacmap": "PaCMAP",
     "mds": "MDS",
     "localmap": "LocalMAP",
+    "ppca": "ρPCA",
 }
 
 
@@ -51,6 +52,8 @@ _PARAM_ABBREVS: dict[str, str] = {
     "n_init": "ni",
     "max_iter": "mi",
     "eps": "e",
+    "regularization_mu": "mu",
+    "standard_scale": "scale",
 }
 
 

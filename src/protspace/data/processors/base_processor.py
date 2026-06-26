@@ -42,11 +42,26 @@ class BaseProcessor:
             "max_iter",
             "eps",
             "random_state",
+            "regularization_mu",
+            "standard_scale",
         }
         filtered_config = {
             k: v for k, v in self.config.items() if k in valid_config_keys
         }
         config = DimensionReductionConfig(n_components=dims, **filtered_config)
+
+        # Non-scalar side channels for reducers that need data prepared by the
+        # pipeline. DimensionReductionConfig is frozen, so attach these with
+        # object.__setattr__. The only current user is ρPCA.
+        for side_key in (
+            "background_data",
+            "target_data",
+            "background_source",
+            "background_n_samples",
+            "background_details",
+        ):
+            if side_key in self.config and self.config[side_key] is not None:
+                object.__setattr__(config, side_key, self.config[side_key])
 
         # Special handling for MDS when using similarity matrix
         if method == MDS_NAME and config.precomputed is True:
