@@ -48,6 +48,7 @@ def plot_khp_results(
     df: pd.DataFrame,
     output_dir: Path,
     k_per_level: dict[str, int] | None = None,
+    error_source: str = "seeds",
 ) -> None:
     """Save bar chart and purity-curve figures.
 
@@ -61,7 +62,14 @@ def plot_khp_results(
         Directory for output PNGs.
     k_per_level:
         Adaptive k values per level (used in figure titles).
+    error_source:
+        What the ``khp_{level}_std`` columns represent — ``"seeds"`` (default,
+        seed-robustness workflow) or ``"hyperparams"`` (hyperparameter-robustness
+        workflow).  Only affects axis labels / titles, not the data drawn.
     """
+    err_desc = (
+        "hyperparameter configurations" if error_source == "hyperparams" else "seeds"
+    )
     try:
         import matplotlib.patches as mpatches
         import matplotlib.pyplot as plt
@@ -194,9 +202,10 @@ def plot_khp_results(
 
     ax.set_xticks(x)
     ax.set_xticklabels(_LEVEL_NAMES, fontsize=9)
-    ax.set_ylabel("k-NN Purity (mean ± std)", fontsize=9)
+    ax.set_ylabel(f"k-NN Purity (mean ± std across {err_desc})", fontsize=9)
     ax.set_title(
-        f"CATH Hierarchy Preservation — k-NN Purity (Adaptive k)\n({k_str})",
+        f"CATH Hierarchy Preservation — k-NN Purity (Adaptive k)\n"
+        f"({k_str})  —  error bars: ±1 std across {err_desc}",
         fontsize=9,
     )
     ax.set_ylim(0, 1.05)
@@ -239,7 +248,7 @@ def plot_khp_results(
     ax.set_ylabel("k-NN Purity (mean ± 1 std)", fontsize=9)
     ax.set_title(
         "Purity Degradation Across CATH Hierarchy Levels (Adaptive k)\n"
-        "Shaded regions = ±1 std across seeds",
+        f"Shaded regions = ±1 std across {err_desc}",
         fontsize=9,
     )
     ax.set_ylim(0, 1.0)
@@ -250,3 +259,148 @@ def plot_khp_results(
     fig.savefig(curve_path, dpi=150)
     plt.close(fig)
     logger.info("Saved purity curve to %s", curve_path)
+
+
+# ---------------------------------------------------------------------------
+# Best-vs-default improvement heatmap
+# ---------------------------------------------------------------------------
+
+# Display order + labels for the improvement heatmap (rows)
+_HEATMAP_METHOD_ORDER = ["pca", "umap", "tsne", "pacmap", "localmap", "mds"]
+_HEATMAP_METHOD_LABELS = {
+    "pca": "PCA",
+    "umap": "UMAP",
+    "tsne": "t-SNE",
+    "pacmap": "PaCMAP",
+    "localmap": "LocalMAP",
+    "mds": "MDS",
+}
+# Column order (coarse → fine)
+_HEATMAP_LEVEL_ORDER = ["Class", "Architecture", "Topology", "Homology"]
+
+
+def plot_improvement_heatmap(
+    csv_path: Path,
+    output_path: Path | None = None,
+    colormap: str = "magma",
+) -> Path:
+    """Publication-quality heatmap of best-vs-default k-NN improvement.
+
+    Reads ``best_vs_default_knn.csv`` (columns ``method``, ``hierarchy_level``,
+    ``improvement``), pivots it into a method × hierarchy-level matrix and
+    renders an annotated heatmap.  Also prints summary statistics to stdout.
+
+    Parameters
+    ----------
+    csv_path:
+        Path to ``best_vs_default_knn.csv``.
+    output_path:
+        PNG output path.  Defaults to ``knn_improvement_heatmap.png`` next to
+        the input CSV.
+    colormap:
+        Perceptually uniform matplotlib colormap (e.g. ``"magma"``, ``"viridis"``).
+
+    Returns
+    -------
+    Path to the saved PNG.
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    csv_path = Path(csv_path)
+    output_path = (
+        Path(output_path)
+        if output_path is not None
+        else csv_path.with_name("knn_improvement_heatmap.png")
+    )
+
+    df = pd.read_csv(csv_path)
+
+    # Pivot to method × hierarchy-level, then reorder rows/cols for display.
+    matrix = df.pivot(index="method", columns="hierarchy_level", values="improvement")
+    row_order = [m for m in _HEATMAP_METHOD_ORDER if m in matrix.index]
+    matrix = matrix.reindex(index=row_order, columns=_HEATMAP_LEVEL_ORDER)
+    matrix.index = [_HEATMAP_METHOD_LABELS.get(m, m) for m in matrix.index]
+
+    # ------------------------------------------------------------------
+    # Summary statistics → stdout
+    # ------------------------------------------------------------------
+    method_means = matrix.mean(axis=1)
+    level_means = matrix.mean(axis=0)
+    top_method = method_means.idxmax()
+    top_level = level_means.idxmax()
+    flat_idx = matrix.stack().idxmax()
+    gmax_method, gmax_level = flat_idx
+    gmax_value = matrix.stack().max()
+
+    print("\n" + "=" * 60)
+    print("  Best-vs-Default k-NN Improvement — Summary")
+    print("=" * 60)
+    print(
+        f"  Largest avg improvement (method): {top_method} ({method_means.max():.3f})"
+    )
+    print(f"  Largest avg improvement (level) : {top_level} ({level_means.max():.3f})")
+    print(
+        f"  Global max improvement          : {gmax_value:.3f} "
+        f"({gmax_method} @ {gmax_level})"
+    )
+    print("=" * 60 + "\n")
+
+    # ------------------------------------------------------------------
+    # Heatmap
+    # ------------------------------------------------------------------
+    sns.set_theme(style="white")
+    fig, ax = plt.subplots(figsize=(9, 7))
+
+    sns.heatmap(
+        matrix,
+        ax=ax,
+        cmap=colormap,
+        annot=True,
+        fmt=".3f",
+        annot_kws={"fontsize": 14, "fontweight": "bold"},
+        linewidths=1.0,
+        linecolor="white",
+        square=True,
+        cbar_kws={
+            "label": "Performance Improvement (Best kNN − Default kNN)",
+            "shrink": 0.85,
+        },
+    )
+
+    # High-contrast annotations: dark text on light cells, light on dark.
+    import numpy as np
+
+    vmin, vmax = float(np.nanmin(matrix.values)), float(np.nanmax(matrix.values))
+    span = vmax - vmin if vmax > vmin else 1.0
+    cmap = plt.get_cmap(colormap)
+    flat = matrix.values.flatten()
+    for text, val in zip(ax.texts, flat, strict=False):
+        if np.isnan(val):
+            text.set_text("")
+            continue
+        r, g, b, _ = cmap((val - vmin) / span)
+        luminance = 0.299 * r + 0.587 * g + 0.114 * b
+        text.set_color("white" if luminance < 0.5 else "black")
+
+    ax.set_title(
+        "Sensitivity of DR Methods to kNN Optimization",
+        fontsize=18,
+        fontweight="bold",
+        pad=16,
+    )
+    ax.set_xlabel("CATH Hierarchy Level", fontsize=14, labelpad=10)
+    ax.set_ylabel("DR Method", fontsize=14, labelpad=10)
+    ax.tick_params(axis="x", labelsize=13, rotation=0)
+    ax.tick_params(axis="y", labelsize=13, rotation=0)
+
+    cbar = ax.collections[0].colorbar
+    cbar.ax.yaxis.label.set_size(12)
+    cbar.ax.tick_params(labelsize=11)
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved improvement heatmap to %s", output_path)
+    return output_path

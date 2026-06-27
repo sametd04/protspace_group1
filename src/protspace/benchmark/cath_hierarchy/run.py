@@ -45,6 +45,54 @@ _LEVEL_LABELS = {
 
 
 # ---------------------------------------------------------------------------
+# Shared data loading
+# ---------------------------------------------------------------------------
+
+
+def load_labels(h5_path: Path, max_proteins: int | None = None) -> CATHLabels:
+    """Load CATH embeddings + hierarchy labels, optionally subsampling.
+
+    Shared by the seed-robustness and hyperparameter-robustness workflows so
+    both operate on an identically prepared (and identically subsampled) dataset.
+
+    Parameters
+    ----------
+    h5_path:
+        Path to ``data/cath_s40/prot_t5.h5``.
+    max_proteins:
+        If given and smaller than the dataset, subsample to this many proteins
+        using a fixed RNG seed (42) for reproducibility.
+    """
+    logger.info("Loading CATH embeddings and hierarchy labels …")
+    cath_labels: CATHLabels = load_cath_labels(h5_path)
+
+    logger.info(
+        "Dataset: %d proteins (%d with CATH labels), embedding dim=%d",
+        len(cath_labels.identifiers),
+        cath_labels.n_valid,
+        cath_labels.embeddings.shape[1],
+    )
+
+    if max_proteins is not None and len(cath_labels.identifiers) > max_proteins:
+        logger.info("Subsampling to %d proteins …", max_proteins)
+        rng = np.random.default_rng(42)
+        idx = np.sort(
+            rng.choice(len(cath_labels.identifiers), size=max_proteins, replace=False)
+        )
+        cath_labels = CATHLabels(
+            identifiers=[cath_labels.identifiers[i] for i in idx],
+            embeddings=cath_labels.embeddings[idx],
+            homology=cath_labels.homology[idx],
+            topology=cath_labels.topology[idx],
+            architecture=cath_labels.architecture[idx],
+            cath_class=cath_labels.cath_class[idx],
+            valid_mask=cath_labels.valid_mask[idx],
+        )
+
+    return cath_labels
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -94,33 +142,8 @@ def run_cath_hierarchy_evaluation(
     # ------------------------------------------------------------------
     # 1. Load embeddings + labels
     # ------------------------------------------------------------------
-    logger.info("Loading CATH embeddings and hierarchy labels …")
-    cath_labels: CATHLabels = load_cath_labels(h5_path)
+    cath_labels = load_labels(h5_path, max_proteins=max_proteins)
     embeddings = cath_labels.embeddings
-
-    logger.info(
-        "Dataset: %d proteins (%d with CATH labels), embedding dim=%d",
-        len(cath_labels.identifiers),
-        cath_labels.n_valid,
-        embeddings.shape[1],
-    )
-
-    if max_proteins is not None and len(cath_labels.identifiers) > max_proteins:
-        logger.info("Subsampling to %d proteins …", max_proteins)
-        rng = np.random.default_rng(42)
-        idx = np.sort(
-            rng.choice(len(cath_labels.identifiers), size=max_proteins, replace=False)
-        )
-        embeddings = embeddings[idx]
-        cath_labels = CATHLabels(
-            identifiers=[cath_labels.identifiers[i] for i in idx],
-            embeddings=embeddings,
-            homology=cath_labels.homology[idx],
-            topology=cath_labels.topology[idx],
-            architecture=cath_labels.architecture[idx],
-            cath_class=cath_labels.cath_class[idx],
-            valid_mask=cath_labels.valid_mask[idx],
-        )
 
     # ------------------------------------------------------------------
     # 2. Group-size analysis → adaptive k

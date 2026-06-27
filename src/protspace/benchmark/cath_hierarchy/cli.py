@@ -6,10 +6,19 @@ k-NN Hierarchy Purity at each CATH level (Class, Architecture, Topology,
 Homology) using an adaptive k per level, prints a comparison table, and saves
 results + plots.
 
+Two modes (``--mode``):
+
+* ``seed`` (default) — vary only the random seed; error bars = std across seeds.
+* ``hyperparam``    — vary DR hyperparameters (grids from robustness/config.py),
+  seed-average each config, then report mean ± std across HP configurations.
+
 Usage examples
 --------------
-# Full run — all 6 DR methods, 10 seeds each:
+# Seed robustness — all 6 DR methods, default seeds:
     uv run python src/protspace/benchmark/cath_hierarchy/cli.py
+
+# Hyperparameter robustness — all methods with HP grids:
+    uv run python src/protspace/benchmark/cath_hierarchy/cli.py --mode hyperparam
 
 # Fast smoke-test on 500 proteins with only PCA and UMAP:
     uv run python src/protspace/benchmark/cath_hierarchy/cli.py \\
@@ -19,7 +28,7 @@ Usage examples
 
 # Fewer seeds for a quick check:
     uv run python src/protspace/benchmark/cath_hierarchy/cli.py \\
-        --n-seeds 3 \\
+        --seeds 0,7,13 \\
         --output src/protspace/benchmark/cath_hierarchy/results/quick/
 """
 
@@ -35,11 +44,13 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
+from protspace.benchmark.cath_hierarchy.hyperparam import run_cath_hyperparam_evaluation  # noqa: E402, I001
 from protspace.benchmark.cath_hierarchy.run import (
     DEFAULT_SEEDS,
     run_cath_hierarchy_evaluation,
-)  # noqa: E402, I001
+)  # noqa: E402
 from protspace.benchmark.cath_hierarchy.visualize import plot_khp_results  # noqa: E402
+from protspace.benchmark.robustness.config import METHOD_CONFIGS  # noqa: E402
 from protspace.utils.constants import REDUCER_METHODS  # noqa: E402
 
 
@@ -56,15 +67,29 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default=str(Path(__file__).resolve().parent / "results"),
-        help="Output directory for results CSV and plots",
+        default=None,
+        help=(
+            "Output directory for results CSV and plots. Default depends on "
+            "--mode: seed → results/, hyperparam → results/hyperparam/"
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["seed", "hyperparam"],
+        default="seed",
+        help=(
+            "Evaluation mode: 'seed' (default) varies the random seed only; "
+            "'hyperparam' varies DR hyperparameters (from robustness/config.py) "
+            "and reports mean ± std across hyperparameter configurations"
+        ),
     )
     parser.add_argument(
         "--methods",
-        default=",".join(REDUCER_METHODS),
+        default=None,
         help=(
-            "Comma-separated DR methods to benchmark "
-            f"(default: all — {','.join(REDUCER_METHODS)})"
+            "Comma-separated DR methods to benchmark. Default depends on --mode: "
+            f"seed → all ({','.join(REDUCER_METHODS)}); "
+            f"hyperparam → {','.join(METHOD_CONFIGS.keys())}"
         ),
     )
     parser.add_argument(
@@ -114,43 +139,89 @@ def main() -> None:
         print(f"ERROR: HDF5 file not found: {h5_path}", file=sys.stderr)
         sys.exit(1)
 
-    methods = [m.strip() for m in args.methods.split(",") if m.strip()]
-    output_dir = Path(args.output)
+    # Resolve mode-dependent defaults for methods + output dir
+    results_root = Path(__file__).resolve().parent / "results"
+    if args.methods is not None:
+        methods = [m.strip() for m in args.methods.split(",") if m.strip()]
+    elif args.mode == "hyperparam":
+        # PCA first (deterministic, no error bar), then the HP-grid methods.
+        methods = ["pca", *METHOD_CONFIGS.keys()]
+    else:
+        methods = list(REDUCER_METHODS)
+
+    if args.mode == "hyperparam":
+        # Methods without a hyperparameter grid (e.g. PCA) are still allowed —
+        # they run a single baseline config and get no error bar. Only drop
+        # names that aren't valid reducers at all.
+        unsupported = [m for m in methods if m not in REDUCER_METHODS]
+        if unsupported:
+            print(f"  Note: dropping unknown methods {unsupported}")
+            methods = [m for m in methods if m in REDUCER_METHODS]
+        output_dir = Path(args.output) if args.output else results_root / "hyperparam"
+    else:
+        output_dir = Path(args.output) if args.output else results_root
 
     print("\nCATH Hierarchy Preservation Evaluation")
+    print(f"  Mode       : {args.mode}")
     print(f"  H5 file    : {h5_path}")
     print(f"  Output dir : {output_dir}")
     print(f"  Methods    : {methods}")
-    print(f"  Seeds      : {args.seeds}")
+    if args.mode == "hyperparam":
+        print(
+            "  Sweep      : Cartesian product of HP grids, baseline random_state only"
+        )
+    else:
+        print(f"  Seeds      : {args.seeds}")
     if args.max_proteins:
         print(f"  Max proteins: {args.max_proteins} (subsampled)")
     print()
 
-    df = run_cath_hierarchy_evaluation(
-        h5_path=h5_path,
-        output_dir=output_dir,
-        methods=methods,
-        seeds=args.seeds,
-        max_proteins=args.max_proteins,
-    )
+    if args.mode == "hyperparam":
+        result = run_cath_hyperparam_evaluation(
+            h5_path=h5_path,
+            output_dir=output_dir,
+            methods=methods,
+            max_proteins=args.max_proteins,
+        )
+        df = result["aggregated"]
+        error_source = "hyperparams"
+        csv_name = "hyperparam_aggregated.csv"
+    else:
+        df = run_cath_hierarchy_evaluation(
+            h5_path=h5_path,
+            output_dir=output_dir,
+            methods=methods,
+            seeds=args.seeds,
+            max_proteins=args.max_proteins,
+        )
+        error_source = "seeds"
+        csv_name = "cath_hierarchy_results.csv"
 
     if not args.no_plots:
-        # Extract adaptive k values from the first non-reference row
-        k_per_level: dict[str, int] | None = None
-        ref_methods = {"Random Baseline", "Original Embedding"}
-        for _, row in df.iterrows():
-            if row["method"] not in ref_methods:
-                k_per_level = {
-                    "cath_class": int(row["k_cath_class"]),
-                    "architecture": int(row["k_architecture"]),
-                    "topology": int(row["k_topology"]),
-                    "homology": int(row["k_homology"]),
-                }
-                break
-        plot_khp_results(df, output_dir=output_dir, k_per_level=k_per_level)
+        k_per_level = _extract_k_per_level(df)
+        plot_khp_results(
+            df,
+            output_dir=output_dir,
+            k_per_level=k_per_level,
+            error_source=error_source,
+        )
         print(f"Plots saved to: {output_dir}/")
 
-    print(f"\nResults CSV: {output_dir / 'cath_hierarchy_results.csv'}")
+    print(f"\nResults CSV: {output_dir / csv_name}")
+
+
+def _extract_k_per_level(df) -> dict[str, int] | None:
+    """Read the adaptive k values from the first non-reference row of *df*."""
+    ref_methods = {"Random Baseline", "Original Embedding"}
+    for _, row in df.iterrows():
+        if row["method"] not in ref_methods:
+            return {
+                "cath_class": int(row["k_cath_class"]),
+                "architecture": int(row["k_architecture"]),
+                "topology": int(row["k_topology"]),
+                "homology": int(row["k_homology"]),
+            }
+    return None
 
 
 if __name__ == "__main__":
