@@ -53,3 +53,4 @@ venv/
 
 # Logs
 *.log
+.DS_Store
