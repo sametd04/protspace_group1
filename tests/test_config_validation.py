@@ -67,30 +67,6 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="regularization_mu"):
             DimensionReductionConfig(regularization_mu=-0.1)
 
-    def test_background_ratio_valid(self):
-        DimensionReductionConfig(background_ratio=0.3)
-        DimensionReductionConfig(background_ratio=0.01)
-        DimensionReductionConfig(background_ratio=0.99)
-
-    def test_background_ratio_zero_raises(self):
-        with pytest.raises(ValueError, match="background_ratio"):
-            DimensionReductionConfig(background_ratio=0.0)
-
-    def test_background_ratio_one_raises(self):
-        with pytest.raises(ValueError, match="background_ratio"):
-            DimensionReductionConfig(background_ratio=1.0)
-
-    def test_background_ratio_out_of_range(self):
-        with pytest.raises(ValueError, match="background_ratio"):
-            DimensionReductionConfig(background_ratio=1.5)
-        with pytest.raises(ValueError, match="background_ratio"):
-            DimensionReductionConfig(background_ratio=-0.1)
-
-    def test_background_strategy_valid(self):
-        DimensionReductionConfig(background_strategy="random")
-        DimensionReductionConfig(background_strategy="uniform")
-        DimensionReductionConfig(background_strategy="outlier")
-
-    def test_background_strategy_invalid_raises(self):
-        with pytest.raises(ValueError, match="background_strategy"):
-            DimensionReductionConfig(background_strategy="invalid")
+    def test_standard_scale_valid(self):
+        DimensionReductionConfig(standard_scale=True)
+        DimensionReductionConfig(standard_scale=False)

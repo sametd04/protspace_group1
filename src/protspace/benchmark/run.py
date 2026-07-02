@@ -44,6 +44,11 @@ METHOD_TITLES = {
     "pacmap": "PaCMAP",
     "mds": "MDS",
     "localmap": "LocalMAP",
+    "ppca": "ρPCA",
+}
+
+BACKGROUND_FILES = {
+    "swissprot_rr": "background_length_extremes_20pct.h5",
 }
 DEFAULT_DATASET = "3ftx"
 DATASET_CHOICES = ("3ftx", "toxprot", "pla2g2", "cath_s40", "swissprot_rr")
@@ -83,16 +88,32 @@ def run_benchmark(paths: BenchmarkPaths) -> None:
         perplexity=min(30, embeddings.shape[0] // 4),
     )
 
+    methods = list(METHODS)
+
+    bg_file = BACKGROUND_FILES.get(paths.data)
+    if bg_file:
+        bg_path = paths.dataset_dir / bg_file
+        if bg_path.exists():
+            bg_set = load_h5([bg_path])
+            object.__setattr__(config, "background_data", bg_set.data)
+            methods.append("ppca")
+            print(
+                f"ρPCA background: {bg_set.data.shape[0]} proteins "
+                f"from {bg_file}\n"
+            )
+        else:
+            print(f"[warn] Background file {bg_path} not found, skipping ρPCA\n")
+
     metric_functions = default_metric_functions(labels)
 
-    print(f"Benchmarking methods: {', '.join(METHODS)}")
+    print(f"Benchmarking methods: {', '.join(methods)}")
     print(f"Metrics: {', '.join(metric_functions.keys())}\n")
     print("=" * 70)
 
     # Run with normalization
     results = benchmark_methods(
         embeddings=embeddings,
-        methods=METHODS,
+        methods=methods,
         config=config,
         normalize=True,
         metric_functions=metric_functions,
@@ -102,7 +123,7 @@ def run_benchmark(paths: BenchmarkPaths) -> None:
     print("\nRunning without normalization for comparison...")
     _results_raw = benchmark_methods(
         embeddings=embeddings,
-        methods=METHODS,
+        methods=methods,
         config=config,
         normalize=False,
         metric_functions=metric_functions,

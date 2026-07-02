@@ -43,8 +43,6 @@ class BaseProcessor:
             "eps",
             "random_state",
             "regularization_mu",
-            "background_ratio",
-            "background_strategy",
             "standard_scale",
         }
         filtered_config = {
@@ -52,12 +50,18 @@ class BaseProcessor:
         }
         config = DimensionReductionConfig(n_components=dims, **filtered_config)
 
-        # ρPCA-only side channel for the external background ndarray.
-        # DimensionReductionConfig is frozen, so we attach via __setattr__
-        # on the underlying dict. The reducer reads it with
-        # getattr(cfg, "background_data", None).
-        if "background_data" in self.config and self.config["background_data"] is not None:
-            object.__setattr__(config, "background_data", self.config["background_data"])
+        # Side channels for dynamic metadata and non-primitive data types
+        # (ndarrays, pandas frames, dicts). DimensionReductionConfig is
+        # frozen, so we attach via object.__setattr__.
+        for side_key in (
+            "background_data",
+            "target_data",
+            "background_source",
+            "background_n_samples",
+            "background_details",
+        ):
+            if side_key in self.config and self.config[side_key] is not None:
+                object.__setattr__(config, side_key, self.config[side_key])
 
         # Special handling for MDS when using similarity matrix
         if method == MDS_NAME and config.precomputed is True:

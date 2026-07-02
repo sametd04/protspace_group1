@@ -16,6 +16,7 @@ from protspace.utils.constants import (
     MDS_NAME,
     PACMAP_NAME,
     PCA_NAME,
+    PPCA_NAME,
     REDUCER_METHODS,
     TSNE_NAME,
     UMAP_NAME,
@@ -27,6 +28,7 @@ from protspace.utils.reducers import (
     MDSReducer,
     PaCMAPReducer,
     PCAReducer,
+    PPCAReducer,
     TSNEReducer,
     UMAPReducer,
 )
@@ -72,6 +74,7 @@ def _get_reducer_class(method: str) -> type[DimensionReducer]:
         PACMAP_NAME: PaCMAPReducer,
         MDS_NAME: MDSReducer,
         LOCALMAP_NAME: LocalMAPReducer,
+        PPCA_NAME: PPCAReducer,
     }
 
     if method not in reducer_map:

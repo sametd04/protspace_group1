@@ -207,7 +207,7 @@ class TestEmbedSequences:
             "P01315": np.array([4.0, 5.0, 6.0]),
         }
         fake_embed_task = MagicMock()
-        fake_embed_task.run.return_value = fake_result
+        fake_embed_task.run_with_progress.return_value = fake_result
         fake_api.embed.return_value = fake_embed_task
 
         mock_batched.return_value = [["P01308", "P01315"]]
@@ -245,7 +245,7 @@ class TestEmbedSequences:
             "P01308": np.array([1.0, 2.0]),
         }
         fake_embed_task = MagicMock()
-        fake_embed_task.run.return_value = fake_result
+        fake_embed_task.run_with_progress.return_value = fake_result
         fake_api.embed.return_value = fake_embed_task
 
         mock_batched.return_value = [["P01308"]]
