@@ -1,0 +1,12 @@
+3FTx final input preparation summary
+=====================================
+Input rows: 1427
+Rows with full_seq: 783
+Rows without full_seq, using mature_seq fallback: 644
+Rows with mature_seq: 1427
+sp_in_embedding=yes in full_or_mature: 783
+sp_in_embedding=no in full_or_mature: 644
+Wrote: /home/donut/Desktop/2_Semester/Protein Prediction 1/ProtSpace/protspace_group1/results/3ftx_final_rhopca/inputs/3ftx_full_or_mature.fasta
+Wrote: /home/donut/Desktop/2_Semester/Protein Prediction 1/ProtSpace/protspace_group1/results/3ftx_final_rhopca/inputs/3ftx_mature_only.fasta
+Wrote: /home/donut/Desktop/2_Semester/Protein Prediction 1/ProtSpace/protspace_group1/results/3ftx_final_rhopca/inputs/3ftx_annotations_full_or_mature.csv
+Wrote: /home/donut/Desktop/2_Semester/Protein Prediction 1/ProtSpace/protspace_group1/results/3ftx_final_rhopca/inputs/3ftx_annotations_mature_only.csv
