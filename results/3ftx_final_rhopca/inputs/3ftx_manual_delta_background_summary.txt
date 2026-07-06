@@ -1,0 +1,7 @@
+3FTx manual paired-delta background
+pairs_used: 783
+background_rows: 1566
+features: 1024
+definition: B = [+Δ; -Δ], Δ = E(full_i) - E(mature_i) for proteins with full_seq
+delta_energy_over_full_embedding_energy_hint: 0.307648
+background_h5: /home/donut/Desktop/2_Semester/Protein Prediction 1/ProtSpace/protspace_group1/results/3ftx_final_rhopca/inputs/3ftx_manual_paired_delta_background.h5

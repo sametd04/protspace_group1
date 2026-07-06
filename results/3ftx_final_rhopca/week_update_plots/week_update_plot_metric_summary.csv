@@ -1,7 +1,0 @@
-plot,method,label_column,n_label_classes,silhouette,calinski_harabasz,davies_bouldin,adjusted_rand,normalized_mutual_info
-01_full_or_mature_PCA__sp_in_embedding.png,pca2,sp_in_embedding,2,0.608,2263.590,0.621,0.018,0.012
-02_full_or_mature_PCA__major_group.png,pca2,major_group,5,0.521,4188.478,0.645,0.014,0.023
-03_mature_only_PCA__sp_in_embedding.png,pca2,sp_in_embedding,1,N/A,N/A,N/A,N/A,N/A
-04_mature_only_PCA__major_group.png,pca2,major_group,5,0.419,1932.557,0.751,0.002,0.014
-05_full_or_mature_rhoPCA__sp_in_embedding.png,ppca2,sp_in_embedding,2,0.368,845.386,1.133,0.001,0.003
-06_full_or_mature_rhoPCA__major_group.png,ppca2,major_group,5,0.392,1298.895,0.779,-0.006,0.008

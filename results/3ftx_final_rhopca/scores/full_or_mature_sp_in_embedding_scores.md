@@ -1,8 +1,0 @@
-# DR clustering scores
-
-Five scores are reported per coordinate pair and label column. Higher is better for silhouette, Calinski-Harabasz, adjusted Rand, and NMI. Lower is better for Davies-Bouldin.
-
-| source                                                                                                                                                                               | method   | x_col   | y_col   | label_column    |   n_points |   n_label_classes |   n_pred_clusters |   silhouette |   calinski_harabasz |   davies_bouldin |   adjusted_rand |   normalized_mutual_info |
-|:-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:---------|:--------|:--------|:----------------|-----------:|------------------:|------------------:|-------------:|--------------------:|-----------------:|----------------:|-------------------------:|
-| /home/donut/Desktop/2_Semester/Protein Prediction 1/ProtSpace/protspace_group1/results/3ftx_final_rhopca/protspace/full_or_mature_pca_rhopca/tmp/proj_prot_t5_pca2_381e9a6ba35d.npz  | pca2     | pca2_1  | pca2_2  | sp_in_embedding |       1427 |                 2 |                 2 |     0.607929 |            2263.59  |         0.620538 |      0.018184   |               0.0115005  |
-| /home/donut/Desktop/2_Semester/Protein Prediction 1/ProtSpace/protspace_group1/results/3ftx_final_rhopca/protspace/full_or_mature_pca_rhopca/tmp/proj_prot_t5_ppca2_d4fd0709685c.npz | ppca2    | ppca2_1 | ppca2_2 | sp_in_embedding |       1427 |                 2 |                 2 |     0.367575 |             845.386 |         1.13271  |      0.00121024 |               0.00262923 |

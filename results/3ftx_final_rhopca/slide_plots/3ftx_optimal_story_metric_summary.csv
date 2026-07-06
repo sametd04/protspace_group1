@@ -1,0 +1,13 @@
+plot,plot_label,experiment,method,label_column,n_points,n_label_classes,label_silhouette,label_eta2,kmeans_nmi
+01_3ftx_PCA_full_or_mature__sp.png,PCA full-or-mature,3ftx,pca2,sp_in_embedding,1427,2,0.014749262812770387,0.0052527257952592055,0.0007243117250564868
+02_3ftx_PCA_mature_only_positive_control__major_group.png,PCA mature-only positive control,3ftx,pca2,major_group,1427,5,-0.09325351884328731,0.03645714464561962,0.024888764541127685
+03_3ftx_rhoPCA_manual_delta__major_group.png,ρPCA manual Δ,3ftx,ppca2_manual_delta,major_group,1427,5,-0.1606642133129352,0.03240634865240105,0.017860742198062354
+04_3ftx_rhoPCA_unified_annotation__major_group.png,ρPCA unified annotation,3ftx,ppca2_unified,major_group,1427,5,-0.09511505029828299,0.011443940241682752,0.01583673110525577
+backup_00a_3ftx_UMAP_full_or_mature__sp.png,UMAP full-or-mature,3ftx_backup,umap2,sp_in_embedding,1427,2,0.009032513669761056,0.002615369224803705,0.0006102614633473151
+backup_00b_3ftx_UMAP_mature_only__sp.png,UMAP mature-only,3ftx_backup,umap2,sp_in_embedding,1427,1,,,
+backup_01_3ftx_PCA_mature_only_positive_control__sp.png,PCA mature-only,3ftx_backup,pca2,sp_in_embedding,1427,1,,,
+backup_02_3ftx_rhoPCA_manual_delta__sp.png,ρPCA manual Δ,3ftx_backup,ppca2_manual_delta,sp_in_embedding,1427,2,0.02679071287430538,0.013358881284733023,0.0222003531766022
+backup_03_3ftx_rhoPCA_unified_annotation__sp.png,ρPCA unified,3ftx_backup,ppca2_unified,sp_in_embedding,1427,2,0.015582029777065857,0.005325292258956373,0.0022509158514392737
+backup_04_3ftx_PCA_full_or_mature__major_group.png,PCA full-or-mature,3ftx_backup,pca2,major_group,1427,5,-0.0991830422226452,0.03394743162306139,0.040436043494446766
+backup_05_3ftx_UMAP_full_or_mature__major_group.png,UMAP full-or-mature,3ftx_backup,umap2,major_group,1427,5,-0.07136062015180691,0.022727529195220197,0.022730252707890572
+backup_06_3ftx_UMAP_mature_only__major_group.png,UMAP mature-only,3ftx_backup,umap2,major_group,1427,5,-0.03133534172868522,0.009881848931340342,0.029616034440707907
