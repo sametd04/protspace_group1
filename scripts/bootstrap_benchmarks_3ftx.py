@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 from sklearn.manifold import trustworthiness as sklearn_trustworthiness
 from sklearn.model_selection import LeaveOneOut
+from sklearn.metrics import silhouette_score
 from sklearn.neighbors import KNeighborsClassifier
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -65,7 +66,6 @@ def run_ppca_external(target: np.ndarray, background: np.ndarray) -> np.ndarray:
     config = DimensionReductionConfig(
         n_components=2,
         random_state=42,
-        background_strategy="external",
         regularization_mu=1e-3,
     )
     object.__setattr__(config, "background_data", background)
@@ -80,6 +80,13 @@ def compute_trustworthiness(high_d: np.ndarray, low_d: np.ndarray, k: int) -> fl
     n = high_d.shape[0]
     actual_k = min(k, n - 2)
     return float(sklearn_trustworthiness(high_d, low_d, n_neighbors=actual_k, metric="euclidean"))
+
+
+def compute_silhouette(projection: np.ndarray, labels: np.ndarray) -> float:
+    unique = np.unique(labels)
+    if len(unique) < 2:
+        return float("nan")
+    return float(silhouette_score(projection, labels, metric="euclidean"))
 
 
 def compute_knn_accuracy(projection: np.ndarray, labels: np.ndarray, k: int = 15) -> float:
@@ -111,7 +118,7 @@ def bootstrap_metrics(
     n_sub = int(n_samples * subsample_frac)
 
     methods = ["PCA", "UMAP", "pPCA-ToxProt"]
-    metrics = ["trust_k1", "trust_k15", "knn_acc"]
+    metrics = ["trust_k1", "trust_k15", "knn_acc", "silhouette"]
 
     results = {m: {metric: [] for metric in metrics} for m in methods}
 
@@ -134,9 +141,12 @@ def bootstrap_metrics(
             t15 = compute_trustworthiness(sub_target, proj, k=15)
             knn = compute_knn_accuracy(proj, sub_labels, k=15)
 
+            sil = compute_silhouette(proj, sub_labels)
+
             results[method_name]["trust_k1"].append(t1)
             results[method_name]["trust_k15"].append(t15)
             results[method_name]["knn_acc"].append(knn)
+            results[method_name]["silhouette"].append(sil)
 
     return results
 
@@ -156,12 +166,13 @@ def plot_bootstrapped_bars(results: dict, output_dir: Path):
     methods = ["PCA", "UMAP", "pPCA-ToxProt"]
     colors = ["#4C72B0", "#55A868", "#C44E52"]
 
-    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(18, 5))
 
     metric_labels = {
         "trust_k1": "Trustworthiness (k=1)",
         "trust_k15": "Trustworthiness (k=15)",
-        "knn_acc": "kNN Accuracy (LOO, k=15)",
+        "knn_acc": "kNN Accuracy (k=15)",
+        "silhouette": "Silhouette Score",
     }
 
     for ax_idx, (metric_key, metric_label) in enumerate(metric_labels.items()):
@@ -174,27 +185,29 @@ def plot_bootstrapped_bars(results: dict, output_dir: Path):
             ci_lows.append(mean - low)
             ci_highs.append(high - mean)
 
-        bars = ax.bar(methods, means, color=colors, edgecolor="black", linewidth=0.5)
+        bars = ax.bar(methods, means, color=colors, edgecolor="none")
         ax.errorbar(
             methods, means,
             yerr=[ci_lows, ci_highs],
-            fmt="none", capsize=6, capthick=1.5, ecolor="black", linewidth=1.5,
+            fmt="none", capsize=6, capthick=1.2, ecolor="#333333", linewidth=1.2,
         )
 
         ax.set_ylabel(metric_label)
-        ax.set_ylim(0, 1.05)
+        if metric_key == "silhouette":
+            ax.set_ylim(-0.5, 1.05)
+        else:
+            ax.set_ylim(0, 1.05)
         ax.set_title(metric_label)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
 
         for bar, val in zip(bars, means):
+            y_offset = 0.03 if val >= 0 else -0.04
+            va = "bottom" if val >= 0 else "top"
             ax.text(
-                bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.04,
-                f"{val:.3f}", ha="center", va="bottom", fontsize=10, fontweight="bold",
+                bar.get_x() + bar.get_width() / 2, bar.get_height() + y_offset,
+                f"{val:.3f}", ha="center", va=va, fontsize=10, fontweight="bold",
             )
-
-    fig.suptitle(
-        "Bootstrapped Metrics (100 rounds, 80% subsample) — 3FTx · ProtT5",
-        fontsize=13, fontweight="bold",
-    )
     plt.tight_layout()
     out_path = output_dir / "bootstrapped_metrics_3ftx.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -217,16 +230,18 @@ def plot_trustworthiness_k1(results: dict, output_dir: Path):
         ci_lows.append(mean - low)
         ci_highs.append(high - mean)
 
-    bars = ax.bar(methods, means, color=colors, edgecolor="black", linewidth=0.5)
+    bars = ax.bar(methods, means, color=colors, edgecolor="none")
     ax.errorbar(
         methods, means,
         yerr=[ci_lows, ci_highs],
-        fmt="none", capsize=8, capthick=1.5, ecolor="black", linewidth=1.5,
+        fmt="none", capsize=7, capthick=1.2, ecolor="#333333", linewidth=1.2,
     )
 
     ax.set_ylabel("Trustworthiness (k=1)")
     ax.set_ylim(0, 1.05)
-    ax.set_title("Trustworthiness k=1 with 95% CI\n(100 bootstrap rounds, 80% subsample)")
+    ax.set_title("Trustworthiness (k=1)")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
 
     for bar, val in zip(bars, means):
         ax.text(
@@ -278,6 +293,7 @@ def main():
                 "trust_k1": results[method]["trust_k1"][i],
                 "trust_k15": results[method]["trust_k15"][i],
                 "knn_acc": results[method]["knn_acc"][i],
+                "silhouette": results[method]["silhouette"][i],
             })
     df = pd.DataFrame(rows)
     csv_path = output_dir / "bootstrapped_metrics_3ftx.csv"
@@ -290,7 +306,7 @@ def main():
     print("=" * 60)
     for method in ["PCA", "UMAP", "pPCA-ToxProt"]:
         print(f"\n  {method}:")
-        for metric in ["trust_k1", "trust_k15", "knn_acc"]:
+        for metric in ["trust_k1", "trust_k15", "knn_acc", "silhouette"]:
             mean, low, high = compute_ci(results[method][metric])
             print(f"    {metric}: {mean:.4f} [{low:.4f}, {high:.4f}]")
 
