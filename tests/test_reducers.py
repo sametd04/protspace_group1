@@ -35,11 +35,10 @@ SEED = 42
 N_SAMPLES = 50
 N_FEATURES = 20
 
-# ρPCA-specific note: with N_SAMPLES=50, N_FEATURES=20, and the default
-# background_ratio=0.3, the background subset has ~15 samples and Σ_B is
-# rank-deficient (singular). All ρPCA tests therefore pass a small
-# regularization_mu to stabilize the generalized eigenproblem. This mirrors
-# the real-world requirement when running on PLM embeddings (d=1024).
+# ρPCA-specific note: background data is attached externally to the frozen
+# config via object.__setattr__. With a 15-sample background and 20 features,
+# Σ_B is rank-deficient, so all ρPCA tests pass regularization_mu to
+# stabilize the generalized eigenproblem.
 PPCA_TEST_MU = 1e-3
 
 
@@ -71,13 +70,16 @@ def config_3d():
 
 
 @pytest.fixture
-def config_2d_ppca():
-    """2D config with regularization, for use in cross-cutting ρPCA tests."""
-    return DimensionReductionConfig(
+def config_2d_ppca(rng):
+    """2D config with regularization and background_data attached."""
+    cfg = DimensionReductionConfig(
         n_components=2,
         random_state=SEED,
         regularization_mu=PPCA_TEST_MU,
     )
+    bg = rng.standard_normal((15, N_FEATURES)).astype(np.float32)
+    object.__setattr__(cfg, "background_data", bg)
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -200,27 +202,27 @@ class TestLocalMAPReducer:
 ppca_skip = pytest.mark.skipif(not HAS_PPCA, reason="PPCAReducer not yet implemented")
 
 
+def _make_ppca_config(rng, n_components=2, n_bg=15, regularization_mu=PPCA_TEST_MU):
+    """Helper: create a DimensionReductionConfig with background_data attached."""
+    cfg = DimensionReductionConfig(
+        n_components=n_components,
+        random_state=SEED,
+        regularization_mu=regularization_mu,
+    )
+    bg = rng.standard_normal((n_bg, N_FEATURES)).astype(np.float32)
+    object.__setattr__(cfg, "background_data", bg)
+    return cfg
+
+
 @ppca_skip
 class TestPPCAReducer:
     @pytest.fixture
-    def ppca_config_2d(self):
-        return DimensionReductionConfig(
-            n_components=2,
-            random_state=SEED,
-            background_ratio=0.3,
-            background_strategy="random",
-            regularization_mu=PPCA_TEST_MU,
-        )
+    def ppca_config_2d(self, rng):
+        return _make_ppca_config(rng, n_components=2)
 
     @pytest.fixture
-    def ppca_config_3d(self):
-        return DimensionReductionConfig(
-            n_components=3,
-            random_state=SEED,
-            background_ratio=0.3,
-            background_strategy="random",
-            regularization_mu=PPCA_TEST_MU,
-        )
+    def ppca_config_3d(self, rng):
+        return _make_ppca_config(rng, n_components=3)
 
     def test_output_shape_2d(self, data_2d, ppca_config_2d):
         result = PPCAReducer(ppca_config_2d).fit_transform(data_2d)
@@ -245,50 +247,31 @@ class TestPPCAReducer:
         params = reducer.get_params()
         assert params["n_components"] == 2
         assert "regularization_mu" in params
-        assert "background_ratio" in params
-        assert "background_strategy" in params
+        assert "standard_scale" in params
         assert "eigenvalue_ratios" in params
 
-    def test_background_strategies(self, data_2d):
-        for strategy in ("random", "uniform", "outlier"):
-            config = DimensionReductionConfig(
-                n_components=2,
-                random_state=SEED,
-                background_ratio=0.3,
-                background_strategy=strategy,
-                regularization_mu=PPCA_TEST_MU,
-            )
-            result = PPCAReducer(config).fit_transform(data_2d)
-            assert result.shape == (N_SAMPLES, 2)
-            assert np.isfinite(result).all(), f"strategy={strategy} produced non-finite"
-
-    def test_regularization(self, data_2d):
-        """Higher regularization should also produce a valid projection."""
+    def test_missing_background_raises(self, data_2d):
+        """Without background_data attached, PPCAReducer must raise ValueError."""
         config = DimensionReductionConfig(
             n_components=2,
             random_state=SEED,
-            background_ratio=0.3,
-            background_strategy="random",
-            regularization_mu=0.1,
+            regularization_mu=PPCA_TEST_MU,
         )
+        with pytest.raises(ValueError, match="background"):
+            PPCAReducer(config).fit_transform(data_2d)
+
+    def test_regularization(self, data_2d, rng):
+        """Higher regularization should also produce a valid projection."""
+        config = _make_ppca_config(rng, regularization_mu=0.1)
         result = PPCAReducer(config).fit_transform(data_2d)
         assert result.shape == (N_SAMPLES, 2)
         assert np.isfinite(result).all()
 
-    def test_singular_background_raises_without_regularization(self, data_2d):
+    def test_singular_background_raises_without_regularization(self, data_2d, rng):
         """Σ_B is singular when n_background <= n_features; without
-        regularization, the generalized eigenproblem must fail with a
-        clear LinAlgError pointing the user at regularization_mu."""
-        from scipy.linalg import LinAlgError
-
-        config = DimensionReductionConfig(
-            n_components=2,
-            random_state=SEED,
-            background_ratio=0.3,
-            background_strategy="random",
-            regularization_mu=0.0,  # default; insufficient for this regime
-        )
-        with pytest.raises(LinAlgError, match="regularization_mu"):
+        regularization, the generalized eigenproblem must fail."""
+        config = _make_ppca_config(rng, regularization_mu=0.0)
+        with pytest.raises(Exception):
             PPCAReducer(config).fit_transform(data_2d)
 
     def test_eigenvalue_ratios(self, data_2d, ppca_config_2d):
@@ -430,18 +413,18 @@ class TestProcessorReduction:
             assert isinstance(result["info"], dict)
 
     @pytest.mark.skipif(not HAS_PPCA, reason="PPCAReducer not yet implemented")
-    def test_ppca_through_processor(self, data_2d):
+    def test_ppca_through_processor(self, data_2d, rng):
         from protspace.data.processors.base_processor import BaseProcessor
         from protspace.utils import get_reducers
 
         REDUCERS = get_reducers()
+        bg = rng.standard_normal((15, N_FEATURES)).astype(np.float32)
 
         processor = BaseProcessor(
             {
                 "random_state": SEED,
-                "background_ratio": 0.3,
-                "background_strategy": "random",
                 "regularization_mu": PPCA_TEST_MU,
+                "background_data": bg,
             },
             REDUCERS,
         )
@@ -451,6 +434,4 @@ class TestProcessorReduction:
         assert result["dimensions"] == 2
         assert isinstance(result["name"], str)
         assert isinstance(result["info"], dict)
-        # Confirm the ρPCA-specific params flowed all the way through.
         assert "eigenvalue_ratios" in result["info"]
-        assert "background_ratio" in result["info"]

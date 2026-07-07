@@ -13,18 +13,23 @@ class Metric(str, Enum):
     manhattan = "manhattan"
 
 
-class BackgroundStrategy(str, Enum):
-    """Sampling policy for the ρPCA background set."""
+class PpcaMode(str, Enum):
+    """User-facing ρPCA background modes.
 
-    external = "external"
-    random = "random"
-    uniform = "uniform"
-    outlier = "outlier"
+    explicit     : use an external HDF5 embedding set as Σ_B input.
+    annotation   : select background rows from the current dataset by annotation.
+    derived      : build nuisance-only sequences from the current dataset and
+                   embed them as the background.
+    paired_delta : build a signed paired-delta background from paired full and
+                   mature embedding files. This is the recommended mode for
+                   suppressing signal-peptide artifacts in 3FTx.
+    """
 
+    explicit = "explicit"
+    annotation = "annotation"
+    derived = "derived"
+    paired_delta = "paired_delta"
 
-# ---------------------------------------------------------------------------
-# Shared option types
-# ---------------------------------------------------------------------------
 
 Opt_Verbose = Annotated[
     int,
@@ -36,10 +41,7 @@ Opt_Methods = Annotated[
     typer.Option(
         "-m",
         "--methods",
-        help=(
-            "DR methods. Comma-sep or repeat: -m pca2,umap2 or -m pca2 -m umap2. "
-            "Inline params: -m 'umap2:n_neighbors=50;min_dist=0.1'."
-        ),
+        help="DR methods. Comma-sep or repeat: -m pca2,umap2 or -m pca2 -m umap2. Inline params: -m 'umap2:n_neighbors=50;min_dist=0.1'.",
         rich_help_panel="Projection",
     ),
 ]
@@ -71,7 +73,10 @@ Opt_NNeighbors = Annotated[
 Opt_MinDist = Annotated[
     float,
     typer.Option(
-        help="UMAP min distance.", rich_help_panel="Projection", min=0.0, max=0.99
+        help="UMAP min distance.",
+        rich_help_panel="Projection",
+        min=0.0,
+        max=0.99,
     ),
 ]
 Opt_Perplexity = Annotated[
@@ -97,11 +102,7 @@ Opt_MnRatio = Annotated[
 ]
 Opt_FpRatio = Annotated[
     float,
-    typer.Option(
-        help="PaCMAP/LocalMAP further ratio.",
-        rich_help_panel="Projection",
-        min=0.0,
-    ),
+    typer.Option(help="PaCMAP/LocalMAP further ratio.", rich_help_panel="Projection", min=0.0),
 ]
 Opt_NInit = Annotated[
     int,
@@ -115,45 +116,24 @@ Opt_Eps = Annotated[
     float,
     typer.Option(help="MDS convergence tolerance.", rich_help_panel="Projection"),
 ]
-
-# ρPCA-specific options
 Opt_RegularizationMu = Annotated[
     float,
     typer.Option(
         "--regularization-mu",
-        help=(
-            "ρPCA Tikhonov regularization μ added to the background "
-            "covariance Σ_B. Must be ≥ 0. Default 1e-3 is safe for PLM "
-            "embeddings; reduce to 0 only if the background is well-"
-            "conditioned (n_background ≫ n_features)."
-        ),
+        help="ρPCA Tikhonov regularization μ added to the background covariance Σ_B. Default 1e-3.",
         rich_help_panel="Projection",
         min=0.0,
     ),
 ]
-Opt_BackgroundRatio = Annotated[
-    float,
+Opt_PpcaMode = Annotated[
+    PpcaMode,
     typer.Option(
-        "--background-ratio",
+        "--ppca-mode",
         help=(
-            "ρPCA fraction of input samples used as background in "
-            "auto-split modes. Ignored when --ppca-background is set. "
-            "Must lie strictly in (0, 1)."
-        ),
-        rich_help_panel="Projection",
-        min=0.0,
-        max=1.0,
-    ),
-]
-Opt_BackgroundStrategy = Annotated[
-    BackgroundStrategy,
-    typer.Option(
-        "--background-strategy",
-        help=(
-            "ρPCA background construction policy. 'external' uses the "
-            "dataset from --ppca-background; 'random', 'uniform', and "
-            "'outlier' partition the target. If --ppca-background is "
-            "set, this flag is overridden to 'external'."
+            "ρPCA background mode: explicit=external HDF5 background; "
+            "annotation=select background rows from current dataset by annotation; "
+            "derived=embed nuisance-only sequence segments from the current dataset; "
+            "paired_delta=signed paired full-minus-mature embedding deltas."
         ),
         rich_help_panel="Projection",
     ),
@@ -163,40 +143,167 @@ Opt_PpcaBackground = Annotated[
     typer.Option(
         "--ppca-background",
         help=(
-            "Path to an HDF5 file holding background embeddings for ρPCA "
-            "(canonical mode per Carilli/Jackson/Pachter 2025). Must have "
-            "the same embedding dimension as the target. Identifiers are "
-            "not required to overlap with the target."
+            "Explicit ρPCA background HDF5 file. Required for --ppca-mode=explicit. "
+            "Identifiers do not need to overlap with the target, but embedding "
+            "dimensionality must match."
         ),
         rich_help_panel="Projection",
     ),
 ]
+Opt_PpcaBackgroundAnnotation = Annotated[
+    str | None,
+    typer.Option(
+        "--ppca-background-annotation",
+        help=(
+            "Annotation column used by --ppca-mode=annotation to select background "
+            "rows, and optionally by --ppca-mode=derived to choose which rows receive "
+            "derived nuisance-only segments."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaBackgroundValues = Annotated[
+    str | None,
+    typer.Option(
+        "--ppca-background-values",
+        help=(
+            "Comma-separated values in --ppca-background-annotation that define the "
+            "background. If omitted, non-empty/non-missing/truthy values are selected."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaDerivedSegmentColumn = Annotated[
+    str | None,
+    typer.Option(
+        "--ppca-derived-segment-column",
+        help=(
+            "For --ppca-mode=derived: annotation column containing the exact nuisance "
+            "sequence to embed as background, e.g. signal_peptide_sequence. This is "
+            "preferred when available."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaDerivedStartColumn = Annotated[
+    str | None,
+    typer.Option(
+        "--ppca-derived-start-column",
+        help=(
+            "For --ppca-mode=derived: annotation column with 0-based inclusive segment "
+            "start. If omitted, --ppca-derived-fixed-start is used."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaDerivedEndColumn = Annotated[
+    str | None,
+    typer.Option(
+        "--ppca-derived-end-column",
+        help=(
+            "For --ppca-mode=derived: annotation column with 0-based exclusive segment "
+            "end, e.g. SignalP cleavage position converted to Python slicing coordinates."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaDerivedFixedStart = Annotated[
+    int,
+    typer.Option(
+        "--ppca-derived-fixed-start",
+        help="For --ppca-mode=derived: fallback 0-based inclusive segment start.",
+        rich_help_panel="Projection",
+        min=0,
+    ),
+]
+Opt_PpcaDerivedFixedEnd = Annotated[
+    int,
+    typer.Option(
+        "--ppca-derived-fixed-end",
+        help=(
+            "For --ppca-mode=derived: fallback 0-based exclusive segment end. "
+            "Use 0 to require --ppca-derived-end-column or --ppca-derived-segment-column."
+        ),
+        rich_help_panel="Projection",
+        min=0,
+    ),
+]
+Opt_PpcaDerivedMinLength = Annotated[
+    int,
+    typer.Option(
+        "--ppca-derived-min-length",
+        help="For --ppca-mode=derived: discard derived segments shorter than this length.",
+        rich_help_panel="Projection",
+        min=1,
+    ),
+]
+Opt_PpcaDerivedEmbedder = Annotated[
+    str | None,
+    typer.Option(
+        "--ppca-derived-embedder",
+        help=(
+            "For --ppca-mode=derived: embedding model used for nuisance-only segments. "
+            "Defaults to the current embedding set name, so HDF5 inputs should be named "
+            "after their model, e.g. -i prot_t5.h5:prot_t5."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+
+Opt_PpcaPairedFull = Annotated[
+    Path | None,
+    typer.Option(
+        "--ppca-paired-full",
+        help=(
+            "For --ppca-mode=paired_delta: HDF5 embeddings generated from full "
+            "precursor sequences for rows that have both full and mature forms."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaPairedMature = Annotated[
+    Path | None,
+    typer.Option(
+        "--ppca-paired-mature",
+        help=(
+            "For --ppca-mode=paired_delta: HDF5 embeddings generated from mature "
+            "sequences, using identifiers that overlap the full-embedding file."
+        ),
+        rich_help_panel="Projection",
+    ),
+]
+Opt_PpcaPairedDeltaScale = Annotated[
+    float,
+    typer.Option(
+        "--ppca-paired-delta-scale",
+        help=(
+            "For --ppca-mode=paired_delta: scale applied to each signed delta row. "
+            "Use 0.5 for pair-mean deviations ±(full-mature)/2; use 1.0 for a "
+            "stronger nuisance covariance if regularization dominates."
+        ),
+        rich_help_panel="Projection",
+        min=0.0,
+    ),
+]
+
 Opt_StandardScale = Annotated[
     bool,
     typer.Option(
         "--standard-scale/--no-standard-scale",
-        help=(
-            "Per-set standard-scale target and background before computing "
-            "covariances (paper convention). Strongly recommended for PLM "
-            "embeddings whose dimensions have heterogeneous scale."
-        ),
+        help="Per-set standard-scale target and background before computing covariances (ρPCA paper convention).",
         rich_help_panel="Projection",
     ),
 ]
-
 Opt_BatchSize = Annotated[
     int,
-    typer.Option(
-        help="Sequences per Biocentral API call.", rich_help_panel="Embedding"
-    ),
+    typer.Option(help="Sequences per Biocentral API call.", rich_help_panel="Embedding"),
 ]
-
 Opt_Fasta = Annotated[
     Path | None,
     typer.Option(
         "-f",
         "--fasta",
-        help="FASTA for -s/--similarity when input is HDF5.",
+        help="FASTA for -s/--similarity when input is HDF5; also supplies sequences for --ppca-mode=derived.",
         rich_help_panel="Input",
     ),
 ]

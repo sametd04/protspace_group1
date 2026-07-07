@@ -3,6 +3,7 @@
 from collections import Counter
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from protspace.data.loaders.embedding_set import (
@@ -303,46 +304,46 @@ class TestResolveAnnotationNames:
         return pipeline._resolve_annotation_names()
 
     def test_none(self):
-        assert self._resolve(None) == ([], None)
+        assert self._resolve(None) == ([], [])
 
     def test_empty_list(self):
-        assert self._resolve([]) == ([], None)
+        assert self._resolve([]) == ([], [])
 
     def test_single(self):
-        assert self._resolve(["organism_name"]) == (["organism_name"], None)
+        assert self._resolve(["organism_name"]) == (["organism_name"], [])
 
     def test_comma_separated(self):
         assert self._resolve(["organism_name,ec_number"]) == (
             ["organism_name", "ec_number"],
-            None,
+            [],
         )
 
     def test_multiple_items(self):
         assert self._resolve(["organism_name", "ec_number"]) == (
             ["organism_name", "ec_number"],
-            None,
+            [],
         )
 
     def test_strips_whitespace(self):
         assert self._resolve(["  organism_name , ec_number  "]) == (
             ["organism_name", "ec_number"],
-            None,
+            [],
         )
 
     def test_skips_empty_parts(self):
-        assert self._resolve(["a,,b", ""]) == (["a", "b"], None)
+        assert self._resolve(["a,,b", ""]) == (["a", "b"], [])
 
     def test_csv_path(self):
-        assert self._resolve(["metadata.csv"]) == ([], "metadata.csv")
+        assert self._resolve(["metadata.csv"]) == ([], ["metadata.csv"])
 
     def test_csv_with_annotations(self):
         assert self._resolve(["metadata.csv", "default,pfam"]) == (
             ["default", "pfam"],
-            "metadata.csv",
+            ["metadata.csv"],
         )
 
     def test_tsv_path(self):
-        assert self._resolve(["data.tsv", "ec"]) == (["ec"], "data.tsv")
+        assert self._resolve(["data.tsv", "ec"]) == (["ec"], ["data.tsv"])
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +623,7 @@ class TestPrecomputedMDSConfigIsolation:
 
         pipeline.base.process_reduction = fake_reduce
 
-        pipeline._run_reductions([self._make_precomputed_es()])
+        pipeline._run_reductions([self._make_precomputed_es()], pd.DataFrame())
 
         assert "precomputed" not in pipeline.base.config
 
@@ -636,7 +637,7 @@ class TestPrecomputedMDSConfigIsolation:
         original_config_id = id(pipeline.base.config)
 
         with pytest.raises(RuntimeError, match="boom"):
-            pipeline._run_reductions([self._make_precomputed_es()])
+            pipeline._run_reductions([self._make_precomputed_es()], pd.DataFrame())
 
         assert "precomputed" not in pipeline.base.config
         assert id(pipeline.base.config) == original_config_id, (
