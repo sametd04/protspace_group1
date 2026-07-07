@@ -12,14 +12,23 @@
 /docs/publication
 /output/
 
-# --- generated artifacts (outside data/) ---
+# --- data ---
+# Ignore all data directories except whitelisted ones
+/data/*
+!/data/3FTx
+!/data/3ftx
+!/data/Pla2g2
+!/data/pla2g2
+!/data/toxins
+!/data/toxprot
+!/data/jmb_2025
+!/data/cath_s40
+!/data/swissprot_rr
+# Always ignore pdb subdirectories, tmp subdirectories, and .h5 files everywhere
 **/pdb/
 **/tmp/
 **/*.h5
 **/*.npy
-
-# Keep all dataset files versioned
-!/data/**
 
 # Never commit benchmark outputs
 **/metrics.csv
