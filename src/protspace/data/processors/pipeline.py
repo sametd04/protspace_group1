@@ -8,7 +8,7 @@ import json
 import logging
 import shutil
 from collections import Counter
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +22,7 @@ from protspace.data.loaders.embedding_set import (
 )
 from protspace.data.processors.base_processor import BaseProcessor
 from protspace.utils import get_reducers
-from protspace.utils.constants import MDS_NAME, PPCA_NAME
+from protspace.utils.constants import MDS_NAME, METHOD_ALIASES, RHOPCA_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -44,32 +44,45 @@ class ReducerParams:
     eps: float = 1e-6
 
     # ρPCA. Exactly two final pathways are supported:
-    #   --ppca-background: use an existing explicit background HDF5
+    #   --rhopca-background: use an existing explicit background HDF5
     #   --nuisance: build an annotation-defined background inside prepare
     regularization_mu: float = 1e-6
     standard_scale: bool = False
-    ppca_background_path: str = ""
+    rho_output_scale: str = "none"
+    rhopca_background_path: str = ""
     nuisance_specs: tuple[str, ...] = ()
-    nuisance_ridge_alpha: float = 10.0
-    nuisance_cross_fit: int = 5
+    nuisance_ridge_alpha: float | None = None  # None → auto-tune per nuisance (CV-GCV)
+    nuisance_cross_fit: int = 1
     nuisance_block_normalization: str = "none"
     nuisance_write_background: bool = True
 
 
 @dataclass(frozen=True)
 class MethodSpec:
-    """A single DR method with its dimension count and parameter overrides."""
+    """A single DR method with its dimension count and parameter overrides.
+
+    A method may be *chained*: ``pre`` holds ordered pre-reduction stages whose
+    output feeds this (final) stage. E.g. ``rhopca50>umap2`` parses to
+    ``MethodSpec("umap", 2, pre=(MethodSpec("rhopca", 50),))``. A bare method has
+    an empty ``pre``. Only the final stage becomes a viewer projection.
+    """
 
     method: str  # e.g. "umap"
     dims: int  # e.g. 2
     overrides: tuple[tuple[str, int | float | str], ...] = ()
+    pre: tuple["MethodSpec", ...] = ()
 
-    def __str__(self) -> str:
+    def _stage_str(self) -> str:
         base = f"{self.method}{self.dims}"
         if self.overrides:
             params = ";".join(f"{k}={v}" for k, v in self.overrides)
             return f"{base}:{params}"
         return base
+
+    def __str__(self) -> str:
+        if self.pre:
+            return ">".join(p._stage_str() for p in self.pre) + ">" + self._stage_str()
+        return self._stage_str()
 
     @property
     def overrides_dict(self) -> dict[str, int | float | str]:
@@ -107,21 +120,20 @@ def _coerce_value(key: str, raw: str) -> int | float | str:
     return raw
 
 
-def parse_method_spec(method_spec: str) -> MethodSpec:
-    """Parse a method spec string into a MethodSpec.
-
-    Examples:
-        'pca2'                              → MethodSpec('pca', 2)
-        'umap2:n_neighbors=50;min_dist=0.1' → MethodSpec('umap', 2, overrides=...)
-    """
-    # Split on first ':' to separate method from overrides
-    if ":" in method_spec:
-        base, params_str = method_spec.split(":", 1)
+def _parse_stage(stage_spec: str) -> MethodSpec:
+    """Parse one (unchained) stage like 'umap2' or 'rhopca50:rho_output_scale=target_var'."""
+    if ":" in stage_spec:
+        base, params_str = stage_spec.split(":", 1)
     else:
-        base, params_str = method_spec, ""
+        base, params_str = stage_spec, ""
 
     method = "".join(filter(str.isalpha, base))
-    dims = int("".join(filter(str.isdigit, base)))
+    digits = "".join(filter(str.isdigit, base))
+    if not method or not digits:
+        raise ValueError(f"Invalid method spec '{stage_spec}'. Expected e.g. 'umap2'.")
+    # Normalize deprecated method tokens (e.g. 'ppca' → 'rhopca') to canonical.
+    method = METHOD_ALIASES.get(method, method)
+    dims = int(digits)
 
     overrides = {}
     if params_str:
@@ -131,23 +143,56 @@ def parse_method_spec(method_spec: str) -> MethodSpec:
                 continue
             if "=" not in pair:
                 raise ValueError(
-                    f"Invalid parameter format '{pair}' in '{method_spec}'. "
+                    f"Invalid parameter format '{pair}' in '{stage_spec}'. "
                     f"Expected key=value."
                 )
             key, val = pair.split("=", 1)
             key = key.strip()
             if key not in _VALID_OVERRIDE_KEYS:
                 raise ValueError(
-                    f"Unknown parameter '{key}' in '{method_spec}'. "
+                    f"Unknown parameter '{key}' in '{stage_spec}'. "
                     f"Valid parameters: {', '.join(sorted(_VALID_OVERRIDE_KEYS))}"
                 )
             overrides[key] = _coerce_value(key, val.strip())
 
-    return MethodSpec(
-        method=method,
-        dims=dims,
-        overrides=tuple(sorted(overrides.items())),
-    )
+    return MethodSpec(method=method, dims=dims, overrides=tuple(sorted(overrides.items())))
+
+
+def parse_method_spec(method_spec: str) -> MethodSpec:
+    """Parse a method spec, optionally chained with '>' pre-reduction stages.
+
+    Examples:
+        'pca2'              → MethodSpec('pca', 2)
+        'umap2:n_neighbors=50;min_dist=0.1' → MethodSpec('umap', 2, overrides=...)
+        'rhopca50>umap2'      → MethodSpec('umap', 2, pre=(MethodSpec('rhopca', 50),))
+
+    The final (rightmost) stage is the viewer projection and must be 2- or 3-D.
+    Earlier stages are pre-reductions and may have any dimension ≥ 2.
+    """
+    stages = [_parse_stage(s.strip()) for s in method_spec.split(">") if s.strip()]
+    if not stages:
+        raise ValueError(f"Empty method spec: {method_spec!r}")
+
+    final = stages[-1]
+    if final.dims not in {2, 3}:
+        raise ValueError(
+            f"Final projection '{final._stage_str()}' must be 2- or 3-D for the "
+            f"viewer (got {final.dims}); k>3 is only allowed for pre-reduction "
+            f"stages, e.g. '{final.method}{final.dims}>umap2'."
+        )
+    for pre in stages[:-1]:
+        if pre.dims < 2:
+            raise ValueError(f"Pre-reduction stage '{pre._stage_str()}' needs dims ≥ 2.")
+    if len(stages) == 1:
+        return final
+    return replace(final, pre=tuple(stages[:-1]))
+
+
+def chain_descriptor(spec: MethodSpec) -> str:
+    """Short 'via …' descriptor of a chain's pre-stages, for projection names."""
+    if not spec.pre:
+        return ""
+    return "via " + ">".join(f"{p.method}{p.dims}" for p in spec.pre)
 
 
 def parse_methods_arg(raw: list[str]) -> list[MethodSpec]:
@@ -219,7 +264,7 @@ def _json_safe_projection_param(value: Any) -> Any:
         return str(value)
     if isinstance(value, dict):
         return {str(k): _json_safe_projection_param(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_json_safe_projection_param(v) for v in value]
     return value
 
@@ -229,7 +274,7 @@ def _cacheable_params(params: dict[str, Any]) -> dict[str, Any]:
     return {str(k): _json_safe_projection_param(v) for k, v in params.items()}
 
 
-def load_ppca_background_h5(path: str | Path) -> tuple[np.ndarray, list[str], dict[str, Any]]:
+def load_rhopca_background_h5(path: str | Path) -> tuple[np.ndarray, list[str], dict[str, Any]]:
     """Load an explicit ρPCA background HDF5 as a matrix.
 
     The loader intentionally reuses ProtSpace's HDF5 conventions by forcing a
@@ -240,7 +285,7 @@ def load_ppca_background_h5(path: str | Path) -> tuple[np.ndarray, list[str], di
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"ρPCA background not found: {path}")
-    bg_set = load_h5([path], name_override="ppca_background")
+    bg_set = load_h5([path], name_override="rhopca_background")
     B = np.asarray(bg_set.data, dtype=np.float64)
     if B.ndim != 2:
         raise ValueError(f"ρPCA background must be 2D, got {B.shape}.")
@@ -274,7 +319,15 @@ class ReductionPipeline:
         self.config = config
         reducer_dict = asdict(config.reducer_params)
         self.base = BaseProcessor(reducer_dict, get_reducers())
-        self._ppca_background_cache: dict[str, tuple[np.ndarray, list[str], dict[str, Any]]] = {}
+        self._rhopca_background_cache: dict[str, tuple[np.ndarray, list[str], dict[str, Any]]] = {}
+        # Per-run memo of annotation-defined nuisance backgrounds, so several ρPCA
+        # projections sharing one nuisance/embedding (e.g. rhopca2 and rhopca3, or a
+        # viewer projection plus a rhopca-k pre-reduction) build it (and write its
+        # diagnostics) only once.
+        self._nuisance_background_cache: dict[tuple, dict[str, Any]] = {}
+        # Per-run memo of pre-reduction outputs, so several downstream methods on
+        # the same pre-reduction (e.g. rhopca50>umap2 and rhopca50>pca2) reuse it.
+        self._prereduce_cache: dict[tuple[str, tuple[str, ...]], np.ndarray] = {}
 
     def run(self, embedding_sets: list[EmbeddingSet]) -> Path:
         """Execute the full pipeline.
@@ -670,38 +723,38 @@ class ReductionPipeline:
         base = self.config.intermediate_dir
         if base is None:
             base = self.config.output_path if self.config.output_path.suffix == "" else self.config.output_path.parent
-        return base / "ppca_nuisance_backgrounds" / _safe_path_component(emb_set.name)
+        return base / "rhopca_nuisance_backgrounds" / _safe_path_component(emb_set.name)
 
-    def _load_explicit_ppca_background(
+    def _load_explicit_rhopca_background(
         self, background_path: str
     ) -> tuple[np.ndarray, list[str], dict[str, Any]]:
         cache_key = str(Path(background_path).resolve())
-        if cache_key not in self._ppca_background_cache:
-            self._ppca_background_cache[cache_key] = load_ppca_background_h5(background_path)
-        return self._ppca_background_cache[cache_key]
+        if cache_key not in self._rhopca_background_cache:
+            self._rhopca_background_cache[cache_key] = load_rhopca_background_h5(background_path)
+        return self._rhopca_background_cache[cache_key]
 
-    def _prepare_ppca_params(
+    def _prepare_rhopca_params(
         self,
         *,
         emb_set: EmbeddingSet,
         metadata: pd.DataFrame,
         params: dict[str, Any],
     ) -> dict[str, Any]:
-        """Attach the explicit background matrix required by PPCAReducer."""
+        """Attach the explicit background matrix required by RhoPCAReducer."""
         if emb_set.precomputed:
             raise ValueError("ρPCA cannot run on precomputed similarity/distance matrices.")
 
-        background_path = str(params.get("ppca_background_path", "") or "")
+        background_path = str(params.get("rhopca_background_path", "") or "")
         nuisance_specs = tuple(params.get("nuisance_specs", ()) or ())
 
         if background_path and nuisance_specs:
             raise ValueError(
-                "ρPCA received both --ppca-background and --nuisance. Choose one "
+                "ρPCA received both --rhopca-background and --nuisance. Choose one "
                 "background source for a given run."
             )
 
         if background_path:
-            B, bg_headers, details = self._load_explicit_ppca_background(background_path)
+            B, bg_headers, details = self._load_explicit_rhopca_background(background_path)
             if B.shape[1] != emb_set.data.shape[1]:
                 raise ValueError(
                     f"ρPCA background {background_path!r} has {B.shape[1]} "
@@ -720,43 +773,100 @@ class ReductionPipeline:
             }
 
         if nuisance_specs:
-            from protspace.utils.annotation_nuisance_background import (
-                build_annotation_nuisance_background,
+            # Memoize per (embedding set + everything that affects the background),
+            # so multiple ρPCA projections in one run don't rebuild it or re-write
+            # its diagnostics.
+            cache_key = (
+                emb_set.name,
+                nuisance_specs,
+                params.get("nuisance_ridge_alpha", None),
+                int(params.get("nuisance_cross_fit", 1)),
+                str(params.get("nuisance_block_normalization", "none")),
+                float(params.get("regularization_mu", 1e-6)),
+                int(params.get("random_state", 42)),
             )
+            cached = self._nuisance_background_cache.get(cache_key)
+            if cached is None:
+                from protspace.utils.annotation_nuisance_background import (
+                    build_annotation_nuisance_background,
+                )
 
-            result = build_annotation_nuisance_background(
-                ids=list(emb_set.headers),
-                X=np.asarray(emb_set.data, dtype=np.float64),
-                annotations=metadata,
-                nuisance_specs=list(nuisance_specs),
-                ridge_alpha=float(params.get("nuisance_ridge_alpha", 10.0)),
-                cross_fit=int(params.get("nuisance_cross_fit", 5)),
-                random_state=int(params.get("random_state", 42)),
-                block_normalization=str(params.get("nuisance_block_normalization", "none")),
-                target_name=emb_set.name,
-                regularization_mu=float(params.get("regularization_mu", 1e-6)),
-            )
-            out_dir = self._background_output_dir(emb_set)
-            if out_dir is not None:
-                result.write(out_dir)
-                logger.info("Wrote ρPCA nuisance background diagnostics to %s", out_dir)
+                result = build_annotation_nuisance_background(
+                    ids=list(emb_set.headers),
+                    X=np.asarray(emb_set.data, dtype=np.float64),
+                    annotations=metadata,
+                    nuisance_specs=list(nuisance_specs),
+                    ridge_alpha=params.get("nuisance_ridge_alpha", None),
+                    cross_fit=int(params.get("nuisance_cross_fit", 1)),
+                    random_state=int(params.get("random_state", 42)),
+                    block_normalization=str(params.get("nuisance_block_normalization", "none")),
+                    target_name=emb_set.name,
+                    regularization_mu=float(params.get("regularization_mu", 1e-6)),
+                )
+                out_dir = self._background_output_dir(emb_set)
+                if out_dir is not None:
+                    result.write(out_dir)
+                    logger.info("Wrote ρPCA nuisance background diagnostics to %s", out_dir)
+                cached = {
+                    "background_data": result.background,
+                    "background_source": "annotation_nuisance",
+                    "background_n_samples": int(result.background.shape[0]),
+                    "background_details": result.manifest,
+                }
+                self._nuisance_background_cache[cache_key] = cached
 
-            return {
-                **params,
-                "background_data": result.background,
-                "background_source": "annotation_nuisance",
-                "background_n_samples": int(result.background.shape[0]),
-                "background_details": result.manifest,
-            }
+            return {**params, **cached}
 
         raise ValueError(
             "ρPCA requested but no background source was provided. Use either "
-            "--ppca-background background.h5 or, in protspace prepare, one or more "
+            "--rhopca-background background.h5 or, in protspace prepare, one or more "
             "--nuisance specifications."
         )
 
 
     # --- Dimensionality reduction ---
+
+    def _run_prereduction(
+        self,
+        emb_set: EmbeddingSet,
+        metadata: pd.DataFrame,
+        pre_stages: tuple[MethodSpec, ...],
+        global_params: dict[str, Any],
+    ) -> np.ndarray:
+        """Apply the ordered pre-reduction stages, returning the reduced matrix.
+
+        A ρPCA pre-stage must be the first stage (it needs the raw 1024-D
+        embedding to match its background). The result is memoized per run so
+        several downstream methods can share one pre-reduction.
+        """
+        key = (emb_set.name, tuple(str(p) for p in pre_stages))
+        if key in self._prereduce_cache:
+            return self._prereduce_cache[key]
+
+        data = emb_set.data
+        for i, pre in enumerate(pre_stages):
+            if pre.method not in self.base.reducers:
+                raise ValueError(f"Unknown pre-reduction method: {pre.method}")
+            if pre.method == RHOPCA_NAME and i != 0:
+                raise ValueError(
+                    "ρPCA pre-reduction must be the first stage — it needs the raw "
+                    "embedding to match its background."
+                )
+            pre_params = {**global_params, **pre.overrides_dict}
+            if pre.method == RHOPCA_NAME:
+                pre_params = self._prepare_rhopca_params(
+                    emb_set=emb_set, metadata=metadata, params=pre_params
+                )
+            logger.info(
+                "Pre-reducing '%s' with %s %d", emb_set.name, pre.method.upper(), pre.dims
+            )
+            result = _run_with_overridden_config(
+                self.base, pre_params, pre.method, pre.dims, data
+            )
+            data = np.asarray(result["data"])
+
+        self._prereduce_cache[key] = data
+        return data
 
     def _run_reductions(
         self, embedding_sets: list[EmbeddingSet], metadata: pd.DataFrame
@@ -802,18 +912,42 @@ class ReductionPipeline:
                     logger.warning(f"Unknown method: {method}. Skipping.")
                     continue
 
+                # Resolve the input matrix: raw embedding, or a pre-reduction chain.
+                if spec.pre:
+                    input_data = self._run_prereduction(
+                        emb_set, metadata, spec.pre, global_params
+                    )
+                else:
+                    input_data = emb_set.data
+
                 # Merge global defaults with per-method overrides
                 effective_params = {**global_params, **spec.overrides_dict}
 
-                if method == PPCA_NAME:
-                    effective_params = self._prepare_ppca_params(
+                if method == RHOPCA_NAME:
+                    if spec.pre:
+                        raise ValueError(
+                            "ρPCA as the final stage after a pre-reduction is not "
+                            "supported (its background is 1024-D). Use ρPCA as the "
+                            "pre-reduction stage, e.g. 'rhopca50>umap2'."
+                        )
+                    effective_params = self._prepare_rhopca_params(
                         emb_set=emb_set,
                         metadata=metadata,
                         params=effective_params,
                     )
 
-                # Build param suffix for disambiguation
+                # Build param suffix: pre-reduction descriptor + override disambiguation.
                 param_suffix = disambiguation_suffix(spec, method_counts)
+                chain_desc = chain_descriptor(spec)
+                if chain_desc:
+                    param_suffix = (
+                        f"{chain_desc}, {param_suffix}" if param_suffix else chain_desc
+                    )
+                    # Distinguish cache keys of chains that share a final (method, dims).
+                    effective_params = {
+                        **effective_params,
+                        "__prereduce__": [str(p) for p in spec.pre],
+                    }
 
                 cached = self._load_cached_projection(
                     emb_set.name, method, dims, effective_params, param_suffix
@@ -827,7 +961,7 @@ class ReductionPipeline:
 
                 logger.info(f"Applying {method.upper()} {dims} to '{emb_set.name}'")
                 reduction = _run_with_overridden_config(
-                    self.base, effective_params, method, dims, emb_set.data
+                    self.base, effective_params, method, dims, input_data
                 )
 
                 reduction["name"] = format_projection_name(

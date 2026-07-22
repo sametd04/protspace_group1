@@ -44,6 +44,7 @@ class BaseProcessor:
             "random_state",
             "regularization_mu",
             "standard_scale",
+            "rho_output_scale",
         }
         filtered_config = {
             k: v for k, v in self.config.items() if k in valid_config_keys

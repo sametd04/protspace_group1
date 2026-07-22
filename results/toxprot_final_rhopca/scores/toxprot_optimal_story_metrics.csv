@@ -1,7 +1,0 @@
-plot,plot_label,experiment,method,label_column,display_label,n_points,n_label_classes,label_silhouette,label_eta2,kmeans_nmi
-01_toxprot_PCA__length.png,PCA length,toxprot,pca2,length_bin,length,6909,5,-0.03202606400962004,0.4762282580070668,0.2975895120895937
-02_toxprot_PCA__order.png,PCA order,toxprot,pca2,order_plot,order,6909,12,-0.29916285867108705,0.1490727873077693,0.24402517084246364
-03_toxprot_rhoPCA_length_order__length.png,ρPCA length,toxprot,ppca2,length_bin,length,6909,5,-0.10300606093773286,0.007287476133257073,0.07238765092742623
-04_toxprot_rhoPCA_length_order__order.png,ρPCA order,toxprot,ppca2,order_plot,order,6909,12,-0.336666216043919,5.655932709309781e-07,0.11816800974252537
-backup_01_toxprot_UMAP__length.png,UMAP length,toxprot_backup,umap2,length_bin,length,6909,5,-0.01114320821888951,0.16255579639722398,0.2728616642182825
-backup_02_toxprot_UMAP__order.png,UMAP order,toxprot_backup,umap2,order_plot,order,6909,12,-0.2707962109264719,0.08601328468538555,0.2924500109767573

@@ -35,7 +35,8 @@ METHOD_DISPLAY_NAMES: dict[str, str] = {
     "pacmap": "PaCMAP",
     "mds": "MDS",
     "localmap": "LocalMAP",
-    "ppca": "ρPCA",
+    "rhopca": "ρPCA",
+    "ppca": "ρPCA",  # deprecated alias
 }
 
 

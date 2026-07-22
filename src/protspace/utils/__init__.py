@@ -17,14 +17,14 @@ def get_reducers() -> dict:
             MDS_NAME,
             PACMAP_NAME,
             PCA_NAME,
-            PPCA_NAME,
+            RHOPCA_NAME,
             TSNE_NAME,
             UMAP_NAME,
             LocalMAPReducer,
             MDSReducer,
             PaCMAPReducer,
             PCAReducer,
-            PPCAReducer,
+            RhoPCAReducer,
             TSNEReducer,
             UMAPReducer,
         )
@@ -36,7 +36,7 @@ def get_reducers() -> dict:
             PACMAP_NAME: PaCMAPReducer,
             MDS_NAME: MDSReducer,
             LOCALMAP_NAME: LocalMAPReducer,
-            PPCA_NAME: PPCAReducer,
+            RHOPCA_NAME: RhoPCAReducer,
         }
     return _REDUCERS
 
@@ -54,7 +54,8 @@ def __getattr__(name: str):
         "DimensionReductionConfig",
         "REDUCER_METHODS",
         "PCA_NAME",
-        "PPCA_NAME",
+        "RHOPCA_NAME",
+        "PPCA_NAME",  # deprecated alias of RHOPCA_NAME
         "TSNE_NAME",
         "UMAP_NAME",
         "PACMAP_NAME",
@@ -67,7 +68,8 @@ def __getattr__(name: str):
             return get_reducers()
         from . import reducers
 
-        return getattr(reducers, name)
+        # PPCA_NAME is a deprecated alias; reducers only re-exports the canonical name.
+        return getattr(reducers, "RHOPCA_NAME" if name == "PPCA_NAME" else name)
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -81,6 +83,7 @@ def __dir__():
         "REDUCER_METHODS",
         "REDUCERS",
         "PCA_NAME",
+        "RHOPCA_NAME",
         "PPCA_NAME",
         "TSNE_NAME",
         "UMAP_NAME",

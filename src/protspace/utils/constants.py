@@ -13,7 +13,11 @@ UMAP_NAME = "umap"
 PACMAP_NAME = "pacmap"
 MDS_NAME = "mds"
 LOCALMAP_NAME = "localmap"
-PPCA_NAME = "ppca"
+RHOPCA_NAME = "rhopca"
+PPCA_NAME = RHOPCA_NAME  # deprecated alias; the canonical method token is "rhopca"
+
+# Deprecated method tokens normalized to their canonical name at parse time.
+METHOD_ALIASES = {"ppca": RHOPCA_NAME}
 
 REDUCER_METHODS = [
     PCA_NAME,
@@ -22,7 +26,7 @@ REDUCER_METHODS = [
     PACMAP_NAME,
     MDS_NAME,
     LOCALMAP_NAME,
-    PPCA_NAME,
+    RHOPCA_NAME,
 ]
 
 # Metric types
@@ -51,7 +55,7 @@ class DimensionReductionConfig:
         standard_scale: Standardize target/background columns before the ρPCA eigensolve. Defaults to False for ρPCA.
     """
 
-    n_components: int = field(default=2, metadata={"allowed": [2, 3]})
+    n_components: int = field(default=2, metadata={"gte": 2})
     n_neighbors: int = field(default=15, metadata={"gt": 0})
     metric: METRIC_TYPES = field(
         default="euclidean", metadata={"allowed": list(get_args(METRIC_TYPES))}
@@ -71,6 +75,15 @@ class DimensionReductionConfig:
     # side channel because it is an ndarray, not a simple CLI scalar.
     regularization_mu: float = field(default=1e-6, metadata={"gte": 0})
     standard_scale: bool = field(default=False)
+    # ρPCA pre-reduction output scaling (only relevant when ρPCA feeds another DR
+    # method as a k-D pre-reduction). The generalized eigenvectors are
+    # Σ_B-conjugate and ranked by the ratio ρ, so the raw projected axis i has
+    # variance = ρ_i. "none" keeps that (default → 2/3-D viewer plots unchanged);
+    # "target_var" projects onto Euclidean-unit eigenvectors so each axis carries
+    # its real embedding variance (PCA-like); "unit_var" z-scores every axis.
+    rho_output_scale: str = field(
+        default="none", metadata={"allowed": ["none", "target_var", "unit_var"]}
+    )
 
     def __post_init__(self):
         """Validate configuration parameters."""

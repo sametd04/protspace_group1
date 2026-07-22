@@ -1,18 +1,12 @@
-#!/usr/bin/env python3
 """Build annotation-defined nuisance-effect backgrounds for ProtSpace ρPCA.
 
-This module provides reusable helpers for ProtSpace. It takes target embeddings and
-one or more user-declared annotation nuisances, estimates the embedding-space
-component predictable from each nuisance annotation, and writes an explicit
-signed background HDF5 that can be passed to ProtSpace with:
-
-    protspace prepare \
-      -i target_embeddings.h5:prot_t5 \
-      -m ppca2 \
-      --ppca-background OUT/background.h5 \
-      --no-standard-scale \
-      --regularization-mu 1e-6 \
-      -o protspace_output
+Library module. Given target embeddings, an aligned annotation table, and one or
+more user-declared nuisance specs, it estimates the embedding-space component
+predictable from each nuisance and assembles a signed ρPCA background. The single
+public entry point is :func:`build_annotation_nuisance_background`, which returns a
+:class:`NuisanceBackgroundResult` (call ``.write(out_dir)`` to emit ``background.h5``
+plus diagnostics). The ``protspace prepare --nuisance`` pipeline drives it; there is
+no standalone CLI in this module.
 
 Core model for each nuisance k:
 
@@ -20,47 +14,30 @@ Core model for each nuisance k:
     G_k = Φ_k W_k
     B_k = [ +α_k G_k ; -α_k G_k ]
 
-where X is n × d target embeddings, Φ_k is a typed annotation design matrix,
-G_k is the predicted embedding-shift matrix, and B_k is the signed ρPCA
-background block.
+where X is n × d target embeddings, Φ_k is a typed annotation design matrix
+(``type = auto | continuous | binary | categorical | multilabel``), G_k is the
+predicted embedding-shift matrix, and B_k is the signed ρPCA background block.
 
-Supported annotation sources:
-  * CSV / TSV / parquet annotation tables
-  * optional ProtSpace annotation fetching via --fetch-annotations
-  * custom columns, UniProt columns, taxonomy columns, InterPro columns, etc.
-
-Supported nuisance types:
-  * auto
-  * continuous
-  * binary
-  * categorical
-  * multilabel
-
-The script is intentionally permissive: any annotation column can be declared a
-nuisance. It does not decide whether this is biologically sensible. It does,
-however, write diagnostics and warnings for instability, sparsity, missingness,
-high cardinality, and likely overfitting risk.
+Any annotation column can be declared a nuisance; the module does not judge whether
+that is biologically sensible, but it records diagnostics and warnings for
+instability, sparsity, missingness, high cardinality, and overfitting risk.
 """
 
 from __future__ import annotations
 
-import argparse
-import csv
 import json
 import logging
 import math
-import os
 import re
-import sys
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 import h5py
 import numpy as np
 import pandas as pd
-
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import Ridge, RidgeCV
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import PolynomialFeatures, SplineTransformer, StandardScaler
 
@@ -72,10 +49,12 @@ except Exception:  # pragma: no cover - scipy should exist in ProtSpace env
 
 LOGGER = logging.getLogger("annotation_nuisance_background")
 SAFE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
-WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 MISSING_STRINGS = {"", "nan", "none", "null", "na", "n/a", "<n/a>"}
 FALSE_STRINGS = {"false", "0", "no", "n", "absent", "negative", "off"}
 TRUE_STRINGS = {"true", "1", "yes", "y", "present", "positive", "on"}
+
+# Candidate grid for auto-tuning ridge_alpha (annotation→embedding model) via GCV.
+RIDGE_ALPHA_GRID = np.logspace(-2, 4, 13)  # 0.01 … 10000, spans the old fixed 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -91,15 +70,15 @@ class NuisanceSpec:
     name: str
     column: str
     nuisance_type: str = "auto"
-    scale: float = 0.5
-    ridge_alpha: float = 10.0
+    scale: float = 1.0
+    ridge_alpha: float | str = "auto"  # "auto" → CV-GCV tuned; a float fixes it
     cross_fit: int | None = None
     random_state: int = 42
 
-    # Continuous options
-    transform: str = "log1p"
+    # Continuous options ("auto" → CV-selected)
+    transform: str = "auto"
     basis: str = "spline"
-    n_knots: int = 6
+    n_knots: int | str = "auto"
     degree: int = 3
 
     # Categorical / multilabel options
@@ -199,8 +178,8 @@ class NuisanceBackgroundResult:
         manifest = dict(self.manifest)
         manifest["background_h5"] = str(bg_path)
         manifest["recommended_protspace_command"] = (
-            "protspace prepare -i TARGET.h5:MODEL -m pca2,umap2,ppca2 "
-            f"--ppca-background {bg_path} --no-standard-scale "
+            "protspace prepare -i TARGET.h5:MODEL -m pca2,umap2,rhopca2 "
+            f"--rhopca-background {bg_path} --no-standard-scale "
             f"--regularization-mu {manifest.get('regularization_mu', 1e-6)} -o OUT"
         )
         diagnostics_md = render_diagnostics(manifest)
@@ -223,11 +202,11 @@ def safe_id(x: Any) -> str:
 
 
 def json_default(obj: Any) -> Any:
-    if isinstance(obj, (np.integer,)):
+    if isinstance(obj, np.integer):
         return int(obj)
-    if isinstance(obj, (np.floating,)):
+    if isinstance(obj, np.floating):
         return float(obj)
-    if isinstance(obj, (np.ndarray,)):
+    if isinstance(obj, np.ndarray):
         return obj.tolist()
     if isinstance(obj, Path):
         return str(obj)
@@ -339,71 +318,8 @@ def coerce_number_or_bool(value: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# HDF5 I/O
+# HDF5 background output
 # ---------------------------------------------------------------------------
-
-
-def parse_h5_spec(spec: str | Path) -> tuple[Path, str | None]:
-    """Parse `file.h5` or `file.h5:suffix`.
-
-    The suffix is treated as an HDF5 group only if that group exists. This keeps
-    the script compatible with ProtSpace's `file.h5:model_name` colon syntax,
-    where the suffix is often only a model label, not an HDF5 group.
-    """
-    s = str(spec)
-    if ":" in s and not WINDOWS_DRIVE_RE.match(s):
-        left, right = s.rsplit(":", 1)
-        if left.endswith((".h5", ".hdf5")):
-            return Path(left), right or None
-    return Path(s), None
-
-
-def _collect_1d_datasets(group: h5py.Group) -> list[str]:
-    keys: list[str] = []
-    for key, obj in group.items():
-        if isinstance(obj, h5py.Dataset) and obj.ndim == 1:
-            keys.append(key)
-    return keys
-
-
-def _open_embedding_group(h5: h5py.File, requested: str | None, path: Path) -> h5py.Group:
-    if requested and requested in h5:
-        obj = h5[requested]
-        if isinstance(obj, h5py.Group):
-            return obj
-        raise ValueError(f"{path}:{requested} is a dataset, not a group of per-protein vectors")
-    # Fallback for ProtSpace colon syntax: file.h5:prot_t5 usually names the
-    # embedding set for labels, not a group inside the file.
-    return h5
-
-
-def load_h5_matrix(spec: str | Path, ids: Sequence[str] | None = None) -> tuple[list[str], np.ndarray, dict[str, Any]]:
-    path, group_name = parse_h5_spec(spec)
-    if not path.exists():
-        raise FileNotFoundError(f"HDF5 file not found: {path}")
-    loaded_ids: list[str] = []
-    rows: list[np.ndarray] = []
-    with h5py.File(path, "r") as h5:
-        group = _open_embedding_group(h5, group_name, path)
-        keys = list(ids) if ids is not None else _collect_1d_datasets(group)
-        if not keys:
-            raise ValueError(f"No 1D embedding datasets found in {path}")
-        for identifier in keys:
-            if identifier not in group:
-                raise KeyError(f"Identifier {identifier!r} not found in {path}")
-            arr = np.asarray(group[identifier], dtype=np.float64)
-            if arr.ndim != 1:
-                raise ValueError(f"Embedding {identifier!r} is not 1D; shape={arr.shape}")
-            loaded_ids.append(str(identifier))
-            rows.append(arr)
-    X = np.vstack(rows)
-    details = {
-        "path": str(path),
-        "requested_group_or_label": group_name,
-        "n_rows": int(X.shape[0]),
-        "n_features": int(X.shape[1]),
-    }
-    return loaded_ids, X, details
 
 
 def write_h5_matrix(path: str | Path, ids: Sequence[str], X: np.ndarray, *, model_name: str | None = None) -> None:
@@ -419,7 +335,7 @@ def write_h5_matrix(path: str | Path, ids: Sequence[str], X: np.ndarray, *, mode
         if model_name:
             h5.attrs["model_name"] = str(model_name)
         h5.attrs["background_kind"] = "annotation_nuisance_effect"
-        for identifier, vec in zip(ids, X):
+        for identifier, vec in zip(ids, X, strict=False):
             sid = safe_id(identifier)
             if sid in seen:
                 seen[sid] += 1
@@ -430,131 +346,8 @@ def write_h5_matrix(path: str | Path, ids: Sequence[str], X: np.ndarray, *, mode
 
 
 # ---------------------------------------------------------------------------
-# Annotation I/O and fetching
+# Annotation alignment
 # ---------------------------------------------------------------------------
-
-
-def read_table(path: str | Path, *, id_col: str | None = None) -> pd.DataFrame:
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Annotation file not found: {path}")
-    suffix = path.suffix.lower()
-    if suffix in {".csv"}:
-        df = pd.read_csv(path)
-    elif suffix in {".tsv", ".tab"}:
-        df = pd.read_csv(path, sep="\t")
-    elif suffix in {".parquet", ".pq"}:
-        df = pd.read_parquet(path)
-    else:
-        raise ValueError(f"Unsupported annotation file type {suffix!r}; use CSV, TSV, or parquet")
-    if df.empty:
-        raise ValueError(f"Annotation file is empty: {path}")
-    if id_col and id_col in df.columns:
-        pass
-    elif "identifier" in df.columns:
-        id_col = "identifier"
-    elif "protein_id" in df.columns:
-        id_col = "protein_id"
-    else:
-        # ProtSpace custom CSV convention: first column is the identifier.
-        first = str(df.columns[0])
-        df = df.rename(columns={first: "identifier"})
-        id_col = "identifier"
-    if id_col != "identifier":
-        df = df.rename(columns={id_col: "identifier"})
-    df["identifier"] = df["identifier"].astype(str)
-    return df
-
-
-def parse_fasta(path: str | Path) -> dict[str, str]:
-    records: dict[str, str] = {}
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"FASTA file not found: {path}")
-    current: str | None = None
-    chunks: list[str] = []
-    with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            if line.startswith(">"):
-                if current is not None:
-                    records[current] = "".join(chunks).upper()
-                current = line[1:].split()[0]
-                chunks = []
-            else:
-                chunks.append(line.strip())
-        if current is not None:
-            records[current] = "".join(chunks).upper()
-    return records
-
-
-def fetch_protspace_annotations(
-    ids: Sequence[str],
-    annotation_request: str,
-    *,
-    fasta: str | Path | None,
-    output_cache: str | Path | None,
-    scores: bool,
-) -> pd.DataFrame:
-    """Fetch annotations using ProtSpace internals.
-
-    This intentionally mirrors `protspace annotate` but accepts the already-loaded
-    target HDF5 identifiers from this script.
-    """
-    try:
-        from protspace.data.annotations.configuration import AnnotationConfiguration
-        from protspace.data.annotations.manager import ProteinAnnotationManager
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            "--fetch-annotations requires running inside an environment where protspace is importable"
-        ) from exc
-
-    names: list[str] = []
-    for item in annotation_request.split(","):
-        item = item.strip()
-        if item:
-            names.append(item)
-    annotations_list = AnnotationConfiguration(names).user_annotations if names else None
-
-    sequences = parse_fasta(fasta) if fasta else {}
-    output_path = Path(output_cache) if output_cache else None
-    if output_path:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    df = ProteinAnnotationManager(
-        headers=list(ids),
-        annotations=annotations_list,
-        output_path=output_path,
-        sequences=sequences,
-    ).to_pd()
-    if not scores:
-        try:
-            from protspace.data.annotations.scores import strip_scores_from_df
-
-            df = strip_scores_from_df(df)
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Could not strip annotation scores: %s", exc)
-    if "identifier" not in df.columns:
-        id_col = df.columns[0]
-        df = df.rename(columns={id_col: "identifier"})
-    df["identifier"] = df["identifier"].astype(str)
-    return df
-
-
-def merge_annotation_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
-    """Merge frames on identifier. Later frames override earlier column names."""
-    if not frames:
-        raise ValueError("No annotation sources provided")
-    merged = frames[0].drop_duplicates("identifier", keep="last").copy()
-    for frame in frames[1:]:
-        frame = frame.drop_duplicates("identifier", keep="last").copy()
-        overlap = (set(merged.columns) & set(frame.columns)) - {"identifier"}
-        if overlap:
-            merged = merged.drop(columns=sorted(overlap))
-        merged = merged.merge(frame, on="identifier", how="outer")
-    return merged
 
 
 def align_annotations(ids: Sequence[str], annotations: pd.DataFrame) -> pd.DataFrame:
@@ -570,7 +363,24 @@ def align_annotations(ids: Sequence[str], annotations: pd.DataFrame) -> pd.DataF
 # ---------------------------------------------------------------------------
 
 
-def parse_nuisance_spec(raw: str, *, global_cross_fit: int, global_ridge_alpha: float, random_state: int) -> NuisanceSpec:
+def _resolve_alpha(value: Any) -> float | str:
+    """Resolve a ridge_alpha value: None/'auto' → 'auto' (CV-tuned), else a float."""
+    if value is None:
+        return "auto"
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    return float(value)
+
+
+def _resolve_n_knots(value: Any) -> int | str:
+    if value is None:
+        return "auto"
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    return int(value)
+
+
+def parse_nuisance_spec(raw: str, *, global_cross_fit: int, global_ridge_alpha: float | str | None, random_state: int) -> NuisanceSpec:
     raw = raw.strip()
     if not raw:
         raise ValueError("Empty --nuisance spec")
@@ -604,13 +414,13 @@ def parse_nuisance_spec(raw: str, *, global_cross_fit: int, global_ridge_alpha: 
         name=safe_id(name),
         column=column,
         nuisance_type=str(opts.get("type", opts.get("nuisance_type", "auto"))).lower(),
-        scale=float(opts.get("scale", 0.5)),
-        ridge_alpha=float(opts.get("ridge_alpha", global_ridge_alpha)),
+        scale=float(opts.get("scale", 1.0)),
+        ridge_alpha=_resolve_alpha(opts.get("ridge_alpha", global_ridge_alpha)),
         cross_fit=int(opts["cross_fit"]) if "cross_fit" in opts and opts["cross_fit"] is not None else global_cross_fit,
         random_state=int(opts.get("random_state", random_state)),
-        transform=str(opts.get("transform", "log1p")).lower(),
+        transform=str(opts.get("transform", "auto")).lower(),
         basis=str(opts.get("basis", opts.get("model", "spline"))).lower(),
-        n_knots=int(opts.get("n_knots", 6)),
+        n_knots=_resolve_n_knots(opts.get("n_knots", "auto")),
         degree=int(opts.get("degree", 3)),
         min_count=int(opts.get("min_count", 5)),
         max_features=int(opts.get("max_features", 5000)),
@@ -779,12 +589,29 @@ def build_continuous_design(series: pd.Series, spec: NuisanceSpec, *, name: str,
     else:
         raise ValueError(f"Continuous column {spec.column!r}: missing policy {missing_policy!r} not supported")
 
-    if spec.transform == "log1p":
-        valid = values >= 0
-        mask &= valid
+    # Resolve the "auto" sentinel to a concrete default here (used when this design is
+    # built directly, i.e. not via the CV selection in select_continuous_design):
+    # log1p when the column is non-negative (the negative fallback below handles the
+    # rest), and 6 spline knots.
+    effective_transform = "log1p" if spec.transform == "auto" else spec.transform
+    n_knots_req = 6 if spec.n_knots == "auto" else int(spec.n_knots)
+
+    # log1p is undefined for negatives. Rather than silently dropping those rows,
+    # fall back to identity for the whole column and warn (the spline/poly basis still
+    # models nonlinearity). Positive-only data (length, counts, …) keeps using log1p.
+    if effective_transform == "log1p":
+        n_negative = int(np.sum(values[mask] < 0))
+        if n_negative:
+            warnings.append(
+                f"{n_negative} negative value(s) present; log1p is undefined for "
+                "negatives → falling back to transform=identity (no rows dropped)"
+            )
+            effective_transform = "none"
+
+    if effective_transform == "log1p":
         z_values = np.full(n, np.nan, dtype=float)
         z_values[mask] = np.log1p(values[mask])
-    elif spec.transform in {"none", "identity"}:
+    elif effective_transform in {"none", "identity"}:
         z_values = values.astype(float)
     else:
         raise ValueError(f"Continuous column {spec.column!r}: unknown transform {spec.transform!r}")
@@ -801,16 +628,18 @@ def build_continuous_design(series: pd.Series, spec: NuisanceSpec, *, name: str,
     details: dict[str, Any] = {
         "missing_policy": missing_policy,
         "n_missing": n_missing,
-        "transform": spec.transform,
+        "transform": effective_transform,
+        "transform_requested": spec.transform,
         "basis": basis,
         "degree": degree,
         "n_unique_values": unique_n,
     }
     if basis in {"spline", "spline_ridge"}:
-        n_knots = max(2, min(int(spec.n_knots), unique_n))
+        n_knots = max(2, min(n_knots_req, unique_n))
         transformer = SplineTransformer(n_knots=n_knots, degree=degree, include_bias=False)
         H = transformer.fit_transform(z)
         details["n_knots"] = n_knots
+        details["n_knots_requested"] = spec.n_knots
     elif basis in {"poly", "polynomial", "poly_ridge"}:
         transformer = PolynomialFeatures(degree=degree, include_bias=False)
         H = transformer.fit_transform(z)
@@ -945,7 +774,7 @@ def build_categorical_design(series: pd.Series, spec: NuisanceSpec, *, name: str
     H = sparse.csr_matrix((data, (row_ind, col_ind)), shape=(len(s_used), len(categories)))
     if len(categories) > max(50, len(s_used) // 5):
         warnings.append("high-cardinality categorical annotation; cross-fitting is strongly recommended")
-    if missing_count / max(1, int((base_mask.sum() if base_mask is not None else n))) > 0.5:
+    if missing_count / max(1, int(base_mask.sum() if base_mask is not None else n)) > 0.5:
         warnings.append("more than 50% of rows are missing for this categorical annotation")
     return DesignMatrix(
         name=name,
@@ -995,7 +824,7 @@ def build_multilabel_design(series: pd.Series, spec: NuisanceSpec, *, name: str,
 
     # Count tokens only among rows in the active mask.
     counts: dict[str, int] = {}
-    for active, toks in zip(mask, token_lists):
+    for active, toks in zip(mask, token_lists, strict=False):
         if not active:
             continue
         for tok in toks:
@@ -1119,6 +948,8 @@ def is_sparse_matrix(X: Any) -> bool:
 
 
 def fit_ridge(Phi: Any, Y: np.ndarray, *, alpha: float, fit_intercept: bool) -> Ridge:
+    """Fit ridge `Y ≈ Φ W`. `Phi` = encoded-annotation design matrix (n × p),
+    `Y` = centered embeddings (n × d), `alpha` = L2 strength."""
     solver = "lsqr" if is_sparse_matrix(Phi) else "auto"
     model = Ridge(alpha=float(alpha), fit_intercept=fit_intercept, solver=solver)
     try:
@@ -1141,37 +972,186 @@ def fit_ridge(Phi: Any, Y: np.ndarray, *, alpha: float, fit_intercept: bool) -> 
             raise RuntimeError(f"Ridge fit failed: {second_err}; first error: {first_err}") from second_err
 
 
+def _fit_ridgecv(
+    Phi: Any,
+    Y: np.ndarray,
+    *,
+    fit_intercept: bool,
+    fold_ids: Sequence[str] | None,
+    alphas: np.ndarray,
+) -> tuple[RidgeCV, str]:
+    """Fit RidgeCV, preferring order-invariant closed-form GCV; fall back to
+    deterministic canonical-order KFold if GCV rejects the (sparse) design."""
+    grid = np.asarray(alphas, dtype=float)
+    Yf = np.asarray(Y, dtype=np.float64)
+    try:
+        model = RidgeCV(alphas=grid, fit_intercept=fit_intercept, alpha_per_target=False)
+        model.fit(Phi, Yf)
+        return model, "auto_gcv"
+    except Exception:  # noqa: BLE001 — GCV path can reject some sparse layouts
+        from sklearn.model_selection import PredefinedSplit
+
+        n = Yf.shape[0]
+        n_splits = min(5, n)
+        order = (np.argsort(np.asarray(fold_ids, dtype=object), kind="stable")
+                 if fold_ids is not None else np.arange(n))
+        # Deterministic, order-invariant folds: round-robin over the canonical order.
+        test_folds = np.empty(n, dtype=int)
+        test_folds[order] = np.arange(n) % n_splits
+        model = RidgeCV(alphas=grid, fit_intercept=fit_intercept,
+                        cv=PredefinedSplit(test_folds))
+        model.fit(Phi, Yf)
+        return model, "auto_kfold"
+
+
+def select_ridge_alpha(
+    Phi: Any,
+    Y: np.ndarray,
+    *,
+    fit_intercept: bool,
+    fold_ids: Sequence[str] | None = None,
+    alphas: np.ndarray = RIDGE_ALPHA_GRID,
+) -> tuple[float, dict[str, Any]]:
+    """Pick ridge_alpha by cross-validated predictive score (annotation → embedding).
+
+    Uses efficient closed-form GCV (leave-one-out), which is order-invariant. If GCV
+    fails (rare, some sparse designs), falls back to KFold CV over the *canonical
+    identifier order* so the choice stays independent of input row order.
+    """
+    model, source = _fit_ridgecv(
+        Phi, Y, fit_intercept=fit_intercept, fold_ids=fold_ids, alphas=alphas,
+    )
+    return float(model.alpha_), {"ridge_alpha_source": source}
+
+
+def select_continuous_design(
+    series: pd.Series,
+    target: np.ndarray,
+    spec: NuisanceSpec,
+    *,
+    name: str,
+    base_mask: np.ndarray | None = None,
+) -> tuple[DesignMatrix, dict[str, Any]]:
+    """Pick the continuous `transform` / `n_knots` that best predict the embedding.
+
+    Only the axes left as `"auto"` are searched; explicit values are respected. Each
+    candidate design is scored by the same CV predictive score used for ridge_alpha
+    (RidgeCV best CV score, higher = better). Returns the winning design plus a
+    selection record for diagnostics.
+    """
+    raw = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    finite = np.isfinite(raw)
+    all_nonneg = bool(np.all(raw[finite] >= 0)) if finite.any() else False
+
+    if spec.transform != "auto":
+        transforms = [spec.transform]
+    else:
+        transforms = ["log1p", "identity"] if all_nonneg else ["identity"]
+
+    is_spline = spec.basis.lower() in {"spline", "spline_ridge"}
+    if not is_spline or spec.n_knots != "auto":
+        knot_opts = [6 if spec.n_knots == "auto" else int(spec.n_knots)]
+    else:
+        knot_opts = [4, 6, 8, 12]
+
+    X = np.asarray(target, dtype=np.float64)
+    best: tuple[float, DesignMatrix, str, int] | None = None
+    candidates: list[dict[str, Any]] = []
+    for tf in transforms:
+        for nk in knot_opts:
+            cand_spec = NuisanceSpec(**{**asdict(spec), "transform": tf, "n_knots": nk})
+            try:
+                design = build_continuous_design(series, cand_spec, name=name, base_mask=base_mask)
+            except ValueError:
+                continue
+            Yc = X[design.row_mask]
+            Yc = Yc - Yc.mean(axis=0, keepdims=True)
+            model, _ = _fit_ridgecv(
+                design.matrix, Yc, fit_intercept=spec.fit_intercept,
+                fold_ids=None, alphas=RIDGE_ALPHA_GRID,
+            )
+            score = float(model.best_score_)
+            candidates.append({"transform": design.details.get("transform", tf),
+                               "n_knots": design.details.get("n_knots"),
+                               "cv_score": score, "ridge_alpha": float(model.alpha_)})
+            if best is None or score > best[0]:
+                best = (score, design, tf, nk)
+
+    if best is None:  # nothing built (degenerate column) — let build_design raise cleanly
+        return build_continuous_design(series, spec, name=name, base_mask=base_mask), {}
+    score, design, tf, nk = best
+    selection = {
+        "selected_transform": design.details.get("transform", tf),
+        "selected_n_knots": design.details.get("n_knots"),
+        "cv_score": score,
+        "candidates": candidates,
+    }
+    design.details["hparam_selection"] = selection
+    return design, selection
+
+
 def ridge_predict_effect(
     Phi: Any,
     Y: np.ndarray,
     *,
-    alpha: float,
+    alpha: float | str,
     cross_fit: int | None,
     random_state: int,
     fit_intercept: bool,
+    fold_ids: Sequence[str] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any], list[str]]:
-    """Predict Y from Phi with ridge, optionally using out-of-fold predictions."""
+    """Predict the effect `E ≈ Φ W` with ridge, optionally out-of-fold.
+
+    `Phi` = encoded-annotation design matrix (n × p), `Y` = centered embeddings
+    (n × d); the returned prediction is the effect `E` used to build the background.
+
+    ``alpha`` may be a float (fixed) or the string ``"auto"`` — in which case it is
+    chosen once by cross-validated GCV (``select_ridge_alpha``) before the (optional)
+    out-of-fold effect estimation runs at that alpha.
+
+    When ``fold_ids`` is given, cross-fit folds are assigned by a canonical ordering
+    of the identifiers rather than by row position, so the out-of-fold predictions
+    (and hence the background) are invariant to the input row order. Assumes the
+    identifiers are unique (true for H5 keys); ties fall back to a stable order.
+    """
     Y = np.asarray(Y, dtype=np.float64)
     n = Y.shape[0]
     warnings: list[str] = []
     if n < 2:
         raise ValueError("Need at least two rows for ridge effect estimation")
 
+    # Resolve an "auto" alpha once (order-invariant), then estimate the effect at it.
+    if isinstance(alpha, str):
+        alpha_value, alpha_details = select_ridge_alpha(
+            Phi, Y, fit_intercept=fit_intercept, fold_ids=fold_ids,
+        )
+        alpha_details["ridge_alpha_grid"] = [float(a) for a in RIDGE_ALPHA_GRID]
+    else:
+        alpha_value = float(alpha)
+        alpha_details = {"ridge_alpha_source": "explicit"}
+
     use_cv = cross_fit is not None and int(cross_fit) > 1 and n >= int(cross_fit)
     if use_cv:
         n_splits = min(int(cross_fit), n)
         pred = np.zeros_like(Y, dtype=np.float64)
         kf = KFold(n_splits=n_splits, shuffle=True, random_state=int(random_state))
+        # Assign folds by canonical identifier order (order-invariant) when ids are
+        # available; otherwise fall back to positional folds.
+        if fold_ids is not None:
+            order = np.argsort(np.asarray(fold_ids, dtype=object), kind="stable")
+        else:
+            order = np.arange(n)
         fold_sizes: list[int] = []
-        for train_idx, test_idx in kf.split(np.arange(n)):
+        for train_pos, test_pos in kf.split(np.arange(n)):
+            train_idx, test_idx = order[train_pos], order[test_pos]
             fold_sizes.append(int(len(test_idx)))
-            model = fit_ridge(Phi[train_idx], Y[train_idx], alpha=alpha, fit_intercept=fit_intercept)
+            model = fit_ridge(Phi[train_idx], Y[train_idx], alpha=alpha_value, fit_intercept=fit_intercept)
             pred[test_idx] = model.predict(Phi[test_idx])
         fit_mode = "cross_fit"
     else:
         if cross_fit and int(cross_fit) > 1 and n < int(cross_fit):
             warnings.append(f"cross_fit={cross_fit} requested but only n={n}; fitting on all rows")
-        model = fit_ridge(Phi, Y, alpha=alpha, fit_intercept=fit_intercept)
+        model = fit_ridge(Phi, Y, alpha=alpha_value, fit_intercept=fit_intercept)
         pred = model.predict(Phi)
         n_splits = 0
         fold_sizes = []
@@ -1181,12 +1161,13 @@ def ridge_predict_effect(
     details = {
         "fit_mode": fit_mode,
         "cross_fit": int(n_splits),
-        "ridge_alpha": float(alpha),
+        "ridge_alpha": float(alpha_value),
         "fit_intercept": bool(fit_intercept),
         "n_fit_rows": int(n),
         "n_design_features": int(Phi.shape[1]),
         "design_is_sparse": bool(is_sparse_matrix(Phi)),
         "fold_sizes": fold_sizes,
+        **alpha_details,
     }
     return pred, details, warnings
 
@@ -1204,7 +1185,15 @@ def trace_second_moment(E: np.ndarray) -> float:
 
 
 def estimate_effect_block(ids: list[str], X: np.ndarray, annotations: pd.DataFrame, spec: NuisanceSpec) -> EffectBlock:
+    """Estimate one nuisance effect block: encode the annotation into a design `Φ`,
+    ridge-fit it against the centered embeddings `X` (n × d), and return the predicted
+    effect `E` (the block later signed into the background). `ids` label the `X` rows."""
     design = build_design(annotations, spec)
+    # For continuous nuisances, CV-select transform / n_knots left as "auto".
+    if design.annotation_type == "continuous" and (spec.transform == "auto" or spec.n_knots == "auto"):
+        design, _sel = select_continuous_design(
+            annotations[spec.column], X, spec, name=spec.name,
+        )
     row_mask = design.row_mask.copy()
     used_indices = np.where(row_mask)[0]
     if len(used_indices) < 2:
@@ -1267,6 +1256,7 @@ def estimate_effect_block(ids: list[str], X: np.ndarray, annotations: pd.DataFra
             cross_fit=spec.cross_fit,
             random_state=spec.random_state + 1009,
             fit_intercept=spec.fit_intercept,
+            fold_ids=[ids[i] for i in used_indices],
         )
         cond_pred = center_effects(cond_pred)
         model_target = X_centered - cond_pred
@@ -1288,6 +1278,7 @@ def estimate_effect_block(ids: list[str], X: np.ndarray, annotations: pd.DataFra
         cross_fit=spec.cross_fit,
         random_state=spec.random_state,
         fit_intercept=spec.fit_intercept,
+        fold_ids=[ids[i] for i in used_indices],
     )
     G = center_effects(G_pred)
     warnings.extend(fit_warnings)
@@ -1445,6 +1436,7 @@ def effect_summary_dataframe(block_details: list[dict[str, Any]]) -> pd.DataFram
                 "fit_mode": fit.get("fit_mode"),
                 "cross_fit": fit.get("cross_fit"),
                 "ridge_alpha": fit.get("ridge_alpha"),
+                "ridge_alpha_source": fit.get("ridge_alpha_source"),
                 "effect_trace_ratio_to_target": est.get("effect_trace_ratio_to_target"),
                 "frobenius_r2_against_model_target": est.get("frobenius_r2_against_model_target"),
                 "warnings": "; ".join(map(str, b.get("warnings", []))),
@@ -1459,8 +1451,8 @@ def build_annotation_nuisance_background(
     X: np.ndarray,
     annotations: pd.DataFrame,
     nuisance_specs: Sequence[str | NuisanceSpec],
-    ridge_alpha: float = 10.0,
-    cross_fit: int = 5,
+    ridge_alpha: float | str | None = "auto",
+    cross_fit: int = 1,
     random_state: int = 42,
     block_normalization: str = "none",
     target_name: str = "target",
@@ -1499,7 +1491,7 @@ def build_annotation_nuisance_background(
                 parse_nuisance_spec(
                     str(spec),
                     global_cross_fit=int(cross_fit),
-                    global_ridge_alpha=float(ridge_alpha),
+                    global_ridge_alpha=_resolve_alpha(ridge_alpha),
                     random_state=int(random_state),
                 )
             )
@@ -1521,8 +1513,8 @@ def build_annotation_nuisance_background(
         "regularization_mu": float(regularization_mu),
         "background_h5": "",
         "recommended_protspace_command": (
-            "protspace prepare -i TARGET.h5:MODEL -m pca2,umap2,ppca2 "
-            "--ppca-background background.h5 --no-standard-scale "
+            "protspace prepare -i TARGET.h5:MODEL -m pca2,umap2,rhopca2 "
+            "--rhopca-background background.h5 --no-standard-scale "
             f"--regularization-mu {regularization_mu} -o OUT"
         ),
         "target": {
@@ -1632,201 +1624,3 @@ def render_diagnostics(manifest: dict[str, Any]) -> str:
                 lines.append(f"  - {w}\n")
         lines.append("\n")
     return "".join(lines)
-
-
-def write_effect_summary(path: str | Path, block_details: list[dict[str, Any]]) -> None:
-    rows: list[dict[str, Any]] = []
-    for b in block_details:
-        est = b.get("estimator_details", {})
-        fit = est.get("fit_details", {}) or {}
-        enc = est.get("encoder_details", {}) or {}
-        rows.append(
-            {
-                "name": b.get("name"),
-                "column": b.get("column"),
-                "type": b.get("type"),
-                "scale": b.get("scale"),
-                "n_effect_rows": b.get("n_effect_rows"),
-                "n_background_rows": b.get("n_background_rows"),
-                "n_features": b.get("n_features"),
-                "resolved_type": est.get("resolved_type"),
-                "n_used_rows": est.get("n_used_rows"),
-                "n_design_features": fit.get("n_design_features", enc.get("n_design_features")),
-                "fit_mode": fit.get("fit_mode"),
-                "cross_fit": fit.get("cross_fit"),
-                "ridge_alpha": fit.get("ridge_alpha"),
-                "effect_trace_ratio_to_target": est.get("effect_trace_ratio_to_target"),
-                "frobenius_r2_against_model_target": est.get("frobenius_r2_against_model_target"),
-                "warnings": "; ".join(map(str, b.get("warnings", []))),
-            }
-        )
-    pd.DataFrame(rows).to_csv(path, index=False)
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Build a signed annotation-nuisance ρPCA background for ProtSpace.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    p.add_argument("--target-h5", required=True, help="Target embedding HDF5. Supports file.h5 or file.h5:model_label/group.")
-    p.add_argument("--annotations", action="append", default=[], help="Annotation CSV/TSV/parquet. Repeatable; later files override earlier columns.")
-    p.add_argument("--fetch-annotations", default="", help="Optional ProtSpace annotation request, e.g. default, all, uniprot,interpro,taxonomy.")
-    p.add_argument("--fasta", default=None, help="Optional FASTA for sequence-dependent ProtSpace annotations.")
-    p.add_argument("--id-col", default="identifier", help="Identifier column for annotation tables. If absent, the first column is used.")
-    p.add_argument("--nuisance", action="append", required=True, help="Nuisance spec, e.g. 'length:type=continuous;scale=0.5'. Repeatable.")
-    p.add_argument("--out", required=True, help="Output directory.")
-
-    p.add_argument("--background-name", default="background.h5", help="Background HDF5 filename inside --out.")
-    p.add_argument("--block-normalization", default="none", choices=["none", "trace", "row_count"], help="Center and optionally normalize each effect block before signing.")
-    p.add_argument("--ridge-alpha", type=float, default=10.0, help="Default ridge regularization for annotation→embedding models.")
-    p.add_argument("--cross-fit", type=int, default=5, help="Default cross-fitting folds. Use 0 or 1 to fit on all rows.")
-    p.add_argument("--random-state", type=int, default=42, help="Random seed for cross-fitting.")
-    p.add_argument("--regularization-mu", type=float, default=1e-6, help="Recommended ProtSpace ρPCA regularization μ to record in manifest.")
-    p.add_argument("--scores", action=argparse.BooleanOptionalAction, default=True, help="Keep annotation confidence scores when fetching ProtSpace annotations.")
-    p.add_argument("--annotation-cache", default=None, help="Optional parquet cache path for fetched ProtSpace annotations.")
-    p.add_argument("--write-design-summary", action="store_true", help="Write design_summary.json with feature names; can be large.")
-    p.add_argument("--verbose", "-v", action="count", default=0, help="Increase logging verbosity.")
-    return p
-
-
-def setup_logging(verbosity: int) -> None:
-    level = logging.WARNING
-    if verbosity == 1:
-        level = logging.INFO
-    elif verbosity >= 2:
-        level = logging.DEBUG
-    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
-    setup_logging(args.verbose)
-
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    ids, X, h5_details = load_h5_matrix(args.target_h5)
-    LOGGER.info("Loaded target embeddings: %d × %d", X.shape[0], X.shape[1])
-
-    annotation_frames: list[pd.DataFrame] = []
-    if args.fetch_annotations:
-        cache_path = args.annotation_cache or str(out_dir / "fetched_annotations.parquet")
-        LOGGER.info("Fetching ProtSpace annotations: %s", args.fetch_annotations)
-        fetched = fetch_protspace_annotations(
-            ids,
-            args.fetch_annotations,
-            fasta=args.fasta,
-            output_cache=cache_path,
-            scores=bool(args.scores),
-        )
-        annotation_frames.append(fetched)
-    for path in args.annotations:
-        annotation_frames.append(read_table(path, id_col=args.id_col))
-    if not annotation_frames:
-        raise SystemExit("Provide --annotations and/or --fetch-annotations")
-
-    annotations = merge_annotation_frames(annotation_frames)
-    aligned = align_annotations(ids, annotations)
-    aligned_path = out_dir / "annotations_aligned.csv"
-    aligned.to_csv(aligned_path, index=False)
-
-    specs = [
-        parse_nuisance_spec(
-            raw,
-            global_cross_fit=int(args.cross_fit),
-            global_ridge_alpha=float(args.ridge_alpha),
-            random_state=int(args.random_state),
-        )
-        for raw in args.nuisance
-    ]
-
-    blocks: list[EffectBlock] = []
-    global_warnings: list[str] = []
-    design_summary: dict[str, Any] = {}
-    for spec in specs:
-        LOGGER.info("Building nuisance block: %s from column %s", spec.name, spec.column)
-        block = estimate_effect_block(ids, X, aligned, spec)
-        blocks.append(block)
-        if block.warnings:
-            global_warnings.extend([f"{block.name}: {w}" for w in block.warnings])
-        # Build a compact design summary. Full feature names only optional.
-        design_summary[block.name] = {
-            "column": block.column,
-            "effect_type": block.effect_type,
-            "details": block.details,
-            "warnings": block.warnings,
-        }
-
-    bg_ids, B, block_details = assemble_background(blocks, block_normalization=args.block_normalization)
-    bg_path = out_dir / args.background_name
-    _, model_label = parse_h5_spec(args.target_h5)
-    write_h5_matrix(bg_path, bg_ids, B, model_name=model_label or "background")
-
-    # Recommended ProtSpace command uses the original target spec exactly.
-    protspace_cmd = (
-        "protspace prepare "
-        f"-i {args.target_h5} "
-        "-m ppca2 "
-        f"--ppca-background {bg_path} "
-        "--no-standard-scale "
-        f"--regularization-mu {args.regularization_mu:g} "
-        "-o protspace_output"
-    )
-
-    manifest: dict[str, Any] = {
-        "script": Path(__file__).name,
-        "target": {
-            "h5": str(args.target_h5),
-            "n_rows": int(X.shape[0]),
-            "n_features": int(X.shape[1]),
-            "h5_details": h5_details,
-        },
-        "annotations": {
-            "files": [str(p) for p in args.annotations],
-            "fetch_annotations": args.fetch_annotations,
-            "fasta": str(args.fasta) if args.fasta else None,
-            "id_col": args.id_col,
-            "aligned_csv": str(aligned_path),
-            "columns": [str(c) for c in aligned.columns],
-        },
-        "background_h5": str(bg_path),
-        "background": {
-            "signed": True,
-            "block_normalization": args.block_normalization,
-            "n_background": int(B.shape[0]),
-            "n_features": int(B.shape[1]),
-            "dtype": "float32",
-            "trace_second_moment": trace_second_moment(B),
-        },
-        "blocks": block_details,
-        "warnings": sorted(set(global_warnings)),
-        "recommended_protspace_args": {
-            "ppca_mode": "explicit",
-            "ppca_background": str(bg_path),
-            "no_standard_scale": True,
-            "regularization_mu": float(args.regularization_mu),
-        },
-        "recommended_protspace_command": protspace_cmd,
-    }
-
-    write_json(out_dir / "background.manifest.json", manifest)
-    write_text(out_dir / "diagnostics.md", render_diagnostics(manifest))
-    write_effect_summary(out_dir / "effect_summary.csv", block_details)
-    if args.write_design_summary:
-        write_json(out_dir / "design_summary.json", design_summary)
-
-    print(json.dumps(manifest, indent=2, default=json_default))
-    print(f"\nWrote background: {bg_path}")
-    print(f"Wrote diagnostics: {out_dir / 'diagnostics.md'}")
-    print("\nRecommended ProtSpace command:")
-    print(protspace_cmd)
-    return 0
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())

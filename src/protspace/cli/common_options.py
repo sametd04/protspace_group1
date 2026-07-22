@@ -39,8 +39,10 @@ Opt_Methods = Annotated[
         "--methods",
         help=(
             "DR methods. Comma-sep or repeat: -m pca2,umap2 or -m pca2 -m umap2. "
-            "Includes ppca2/ppca3 when --ppca-background or --nuisance is supplied. "
-            "Inline params: -m 'umap2:n_neighbors=50;min_dist=0.1'."
+            "Includes rhopca2/rhopca3 when --rhopca-background or --nuisance is supplied. "
+            "Inline params: -m 'umap2:n_neighbors=50;min_dist=0.1'. "
+            "Chain a pre-reduction with '>': -m 'rhopca50>umap2' reduces to the top-50 "
+            "rhoPCA components, then runs UMAP (final stage must be 2- or 3-D)."
         ),
         rich_help_panel="Projection",
     ),
@@ -119,26 +121,29 @@ Opt_Eps = Annotated[
 ]
 
 # ρPCA options. Only the final clean pathways are exposed:
-#   1. --ppca-background for an already-built explicit background
+#   1. --rhopca-background for an already-built explicit background
 #   2. --nuisance for annotation-defined backgrounds inside `prepare`
-Opt_PpcaBackground = Annotated[
+Opt_RhoPcaBackground = Annotated[
     Path | None,
     typer.Option(
-        "--ppca-background",
+        "--rhopca-background",
+        "--ppca-background",  # deprecated alias
         help=(
-            "Explicit ρPCA background HDF5. Required for ppca2/ppca3 in "
+            "Explicit ρPCA background HDF5. Required for rhopca2/rhopca3 in "
             "`project`; optional in `prepare` when --nuisance is supplied."
         ),
         rich_help_panel="ρPCA",
     ),
 ]
+# Deprecated alias for the option type (pre-rename import name).
+Opt_PpcaBackground = Opt_RhoPcaBackground
 Opt_Nuisance = Annotated[
     list[str] | None,
     typer.Option(
         "--nuisance",
         help=(
             "Annotation-defined ρPCA nuisance specification. Repeatable. "
-            "Examples: --nuisance 'sp_in_embedding:type=binary;missing=zero;scale=0.5' "
+            "Examples: --nuisance 'sp_in_embedding:type=binary;missing=zero' "
             "or --nuisance 'length:type=continuous;transform=log1p;basis=spline'. "
             "Only available in `prepare`, because it needs annotation context."
         ),
@@ -166,10 +171,11 @@ Opt_StandardScale = Annotated[
     ),
 ]
 Opt_NuisanceRidgeAlpha = Annotated[
-    float,
+    float | None,
     typer.Option(
         "--nuisance-ridge-alpha",
-        help="Default ridge α for annotation→embedding nuisance models.",
+        help="Ridge α for annotation→embedding nuisance models. Omit to auto-tune per "
+             "nuisance via cross-validated GCV; pass a value to fix it.",
         rich_help_panel="ρPCA",
         min=0.0,
     ),

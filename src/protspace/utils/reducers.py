@@ -15,8 +15,8 @@ from protspace.utils.constants import (  # noqa: F401
     METRIC_TYPES,
     PACMAP_NAME,
     PCA_NAME,
-    PPCA_NAME,
     REDUCER_METHODS,
+    RHOPCA_NAME,
     TSNE_NAME,
     UMAP_NAME,
     DimensionReductionConfig,
@@ -385,13 +385,41 @@ class MDSReducer(DimensionReducer):
 # =============================================================================
 
 
+# Extra eigenpairs requested beyond n_components when using the partial solver, so
+# that non-finite/round-off values in the top band can be filtered without a re-solve.
+_EIG_SUBSET_BUFFER = 10
+
+
+def _finalize_eigpairs(
+    eigenvalues: np.ndarray, eigenvectors: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Drop non-finite / negative round-off eigenpairs and sort descending by ρ.
+
+    Covariance matrices are PSD in theory, but generalized eigensolvers may emit
+    tiny negative round-off values; keep the finite, numerically non-negative ones.
+    """
+    tol = 1e-12
+    valid = np.isfinite(eigenvalues) & (eigenvalues > -tol)
+    eigenvalues = np.maximum(eigenvalues[valid], 0.0)
+    eigenvectors = eigenvectors[:, valid]
+    order = np.argsort(eigenvalues)[::-1]
+    return eigenvalues[order], eigenvectors[:, order]
+
+
 def _solve_rho_eigenproblem(
     sigma_target: np.ndarray,
     sigma_background: np.ndarray,
     n_components: int,
     regularization_mu: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Solve Σ_T v = λ(Σ_B + μI)v and return the top eigenpairs."""
+    """Solve Σ_T v = λ(Σ_B + μI)v and return the top eigenpairs.
+
+    Only the top ``n_components`` are needed, so when they are a small fraction of
+    the feature dimension we request just those from the partial eigensolver
+    (``subset_by_index``) — identical to the full solve but markedly faster. For
+    large ``n_components`` (≳ half the dimension) the full solve is faster, so we
+    use it there; a full solve is also the fallback if the partial one is degenerate.
+    """
     from scipy.linalg import LinAlgError, eigh
 
     if sigma_target.ndim != 2 or sigma_background.ndim != 2:
@@ -411,8 +439,24 @@ def _solve_rho_eigenproblem(
     if regularization_mu > 0.0:
         sigma_background_reg += float(regularization_mu) * np.eye(d, dtype=np.float64)
 
+    def _full() -> tuple[np.ndarray, np.ndarray]:
+        return _finalize_eigpairs(*eigh(sigma_target, sigma_background_reg))
+
     try:
-        eigenvalues, eigenvectors = eigh(sigma_target, sigma_background_reg)
+        if 2 * n_components <= d:
+            # The top ρ eigenpairs are the largest; request a small buffer so the
+            # filtering below can survive stray non-finite values without re-solving.
+            m = min(d, n_components + _EIG_SUBSET_BUFFER)
+            try:
+                eigenvalues, eigenvectors = _finalize_eigpairs(
+                    *eigh(sigma_target, sigma_background_reg, subset_by_index=[d - m, d - 1])
+                )
+                if eigenvalues.size < n_components:  # rare: non-finite in the top band
+                    eigenvalues, eigenvectors = _full()
+            except LinAlgError:
+                eigenvalues, eigenvectors = _full()  # partial driver can be pickier
+        else:
+            eigenvalues, eigenvectors = _full()
     except LinAlgError as err:
         raise LinAlgError(
             "ρPCA generalized eigenproblem failed: Σ_B is not positive "
@@ -420,17 +464,6 @@ def _solve_rho_eigenproblem(
             f"regularization_mu (currently {regularization_mu}). "
             f"Original error: {err}"
         ) from err
-
-    # Covariance matrices are PSD in theory, but generalized eigensolvers may
-    # produce tiny negative round-off values. Keep finite, numerically non-negative
-    # eigenpairs and sort descending by contrastive ratio.
-    tol = 1e-12
-    valid = np.isfinite(eigenvalues) & (eigenvalues > -tol)
-    eigenvalues = np.maximum(eigenvalues[valid], 0.0)
-    eigenvectors = eigenvectors[:, valid]
-    order = np.argsort(eigenvalues)[::-1]
-    eigenvalues = eigenvalues[order]
-    eigenvectors = eigenvectors[:, order]
 
     if eigenvalues.size < n_components:
         raise ValueError(
@@ -487,7 +520,7 @@ def _project_full_input(
     return (data_projected @ top_eigvecs).astype(np.float64)
 
 
-class PPCAReducer(DimensionReducer):
+class RhoPCAReducer(DimensionReducer):
     """ρPCA via a generalized eigenproblem with an explicit background.
 
     The reducer is deliberately small and mathematical: it receives the target
@@ -504,8 +537,11 @@ class PPCAReducer(DimensionReducer):
 
         n_samples, n_features = data.shape
         n_components = int(cfg.n_components)
-        if n_components not in {2, 3}:
-            raise ValueError(f"ρPCA supports 2 or 3 components, got {n_components}.")
+        # ρPCA emits 2/3-D for the viewer, or k>3 when used as a pre-reduction
+        # feeding another DR method. The generalized eigensolver handles any k;
+        # the only hard limit is the feature dimension.
+        if n_components < 2:
+            raise ValueError(f"ρPCA needs n_components ≥ 2, got {n_components}.")
         if n_components > n_features:
             raise ValueError(
                 f"n_components={n_components} > n_features={n_features}."
@@ -559,18 +595,37 @@ class PPCAReducer(DimensionReducer):
         self.background_source_ = bg_source
         self.n_background_samples_ = int(X_background.shape[0])
 
-        return _project_full_input(
+        # Output scaling. The eigenvectors are Σ_B-conjugate, so a raw projected
+        # axis i has variance = ρ_i (the contrastive ratio). For a k-D
+        # pre-reduction fed to a distance-based method this over-weights high-ρ
+        # axes; "target_var" instead projects onto Euclidean-unit eigenvectors so
+        # each axis carries its real embedding variance (PCA-like).
+        scale = str(getattr(cfg, "rho_output_scale", "none"))
+        basis = top_eigvecs
+        if scale == "target_var":
+            norms = np.linalg.norm(top_eigvecs, axis=0, keepdims=True)
+            norms = np.where(norms < 1e-12, 1.0, norms)
+            basis = top_eigvecs / norms
+
+        projected = _project_full_input(
             data=data,
             X_target=X_target,
-            top_eigvecs=top_eigvecs,
+            top_eigvecs=basis,
             standard_scale=standard_scale,
         )
+
+        if scale == "unit_var":
+            std = projected.std(axis=0, keepdims=True)
+            std = np.where(std < 1e-12, 1.0, std)
+            projected = (projected - projected.mean(axis=0, keepdims=True)) / std
+
+        return projected
 
     def _resolve_target_background(self, data: np.ndarray, cfg) -> tuple[np.ndarray, np.ndarray, str]:
         background_data = getattr(cfg, "background_data", None)
         if background_data is None:
             raise ValueError(
-                "ρPCA requires a background. Provide --ppca-background or use "
+                "ρPCA requires a background. Provide --rhopca-background or use "
                 "protspace prepare with --nuisance."
             )
 
@@ -620,3 +675,7 @@ class PPCAReducer(DimensionReducer):
         if details:
             params["background_details"] = details
         return params
+
+
+# Backward-compatible alias for the pre-rename class name.
+PPCAReducer = RhoPCAReducer

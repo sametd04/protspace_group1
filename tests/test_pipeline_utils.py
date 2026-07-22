@@ -14,6 +14,7 @@ from protspace.data.loaders.embedding_set import (
 from protspace.data.processors.pipeline import (
     MethodSpec,
     PipelineConfig,
+    ReducerParams,
     ReductionPipeline,
     _run_with_overridden_config,
     disambiguation_suffix,
@@ -61,6 +62,39 @@ class TestParseMethodSpec:
     def test_invalid_no_digits(self):
         with pytest.raises(ValueError):
             parse_method_spec("pca")
+
+
+class TestParseMethodChain:
+    def test_rhopca_prereduce_chain(self):
+        spec = parse_method_spec("rhopca50>umap2")
+        assert spec.method == "umap" and spec.dims == 2
+        assert len(spec.pre) == 1
+        assert spec.pre[0].method == "rhopca" and spec.pre[0].dims == 50
+        assert str(spec) == "rhopca50>umap2"
+
+    def test_ppca_alias_normalizes_to_rhopca(self):
+        # The deprecated 'ppca' token still parses, normalized to canonical 'rhopca'.
+        spec = parse_method_spec("ppca50>umap2")
+        assert spec.pre[0].method == "rhopca"
+        assert str(spec) == "rhopca50>umap2"
+
+    def test_chain_stage_overrides(self):
+        spec = parse_method_spec("rhopca25:rho_output_scale=target_var>umap2:n_neighbors=30")
+        assert spec.pre[0].overrides_dict == {"rho_output_scale": "target_var"}
+        assert spec.overrides_dict == {"n_neighbors": 30}
+
+    def test_bare_method_has_no_pre(self):
+        assert parse_method_spec("umap2").pre == ()
+
+    def test_final_stage_must_be_2_or_3d(self):
+        with pytest.raises(ValueError, match="2- or 3-D"):
+            parse_method_spec("pca10")          # bare k>3 terminal is rejected
+        with pytest.raises(ValueError, match="2- or 3-D"):
+            parse_method_spec("rhopca50>umap10")  # chained terminal must be 2/3-D
+
+    def test_chains_dedup_and_are_distinct(self):
+        specs = parse_methods_arg(["umap2,pca50>umap2,rhopca50>umap2,pca50>umap2"])
+        assert [str(s) for s in specs] == ["umap2", "pca50>umap2", "rhopca50>umap2"]
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +656,7 @@ class TestPrecomputedMDSConfigIsolation:
 
         pipeline.base.process_reduction = fake_reduce
 
-        pipeline._run_reductions([self._make_precomputed_es()])
+        pipeline._run_reductions([self._make_precomputed_es()], None)
 
         assert "precomputed" not in pipeline.base.config
 
@@ -636,9 +670,54 @@ class TestPrecomputedMDSConfigIsolation:
         original_config_id = id(pipeline.base.config)
 
         with pytest.raises(RuntimeError, match="boom"):
-            pipeline._run_reductions([self._make_precomputed_es()])
+            pipeline._run_reductions([self._make_precomputed_es()], None)
 
         assert "precomputed" not in pipeline.base.config
         assert id(pipeline.base.config) == original_config_id, (
             "base.config reference should be the original dict, not a replacement"
         )
+
+
+class TestNuisanceBackgroundCache:
+    """The annotation-defined ρPCA background is built (and its diagnostics written)
+    once per run, then reused by every ρPCA projection sharing it."""
+
+    def test_nuisance_background_built_once(self, monkeypatch):
+        from dataclasses import asdict
+
+        import pandas as pd
+
+        import protspace.utils.annotation_nuisance_background as anb
+
+        calls = {"n": 0}
+        real = anb.build_annotation_nuisance_background
+
+        def spy(**kwargs):
+            calls["n"] += 1
+            return real(**kwargs)
+
+        monkeypatch.setattr(anb, "build_annotation_nuisance_background", spy)
+
+        params = ReducerParams(
+            nuisance_specs=("g:type=binary",), nuisance_write_background=False
+        )
+        config = PipelineConfig(
+            methods=[MethodSpec("rhopca", 2), MethodSpec("rhopca", 3)],
+            output_path=None,
+            reducer_params=params,
+        )
+        pipeline = ReductionPipeline(config)
+        headers = [f"P{i:03d}" for i in range(40)]
+        rng = np.random.default_rng(0)
+        es = EmbeddingSet(
+            name="m", data=rng.standard_normal((40, 8)), headers=headers
+        )
+        meta = pd.DataFrame({"identifier": headers, "g": ["yes", "no"] * 20})
+        pdict = asdict(params)
+
+        p1 = pipeline._prepare_rhopca_params(emb_set=es, metadata=meta, params=pdict)
+        p2 = pipeline._prepare_rhopca_params(emb_set=es, metadata=meta, params=pdict)
+
+        assert calls["n"] == 1, "background rebuilt instead of reused from cache"
+        assert len(pipeline._nuisance_background_cache) == 1
+        assert p1["background_data"] is p2["background_data"]  # same object reused

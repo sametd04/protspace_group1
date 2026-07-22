@@ -28,19 +28,19 @@ from protspace.cli.common_options import (
     Opt_MaxIter,
     Opt_Methods,
     Opt_Metric,
+    Opt_MinDist,
+    Opt_MnRatio,
+    Opt_NInit,
+    Opt_NNeighbors,
     Opt_Nuisance,
     Opt_NuisanceBlockNormalization,
     Opt_NuisanceCrossFit,
     Opt_NuisanceRidgeAlpha,
     Opt_NuisanceWriteBackground,
-    Opt_PpcaBackground,
-    Opt_MinDist,
-    Opt_MnRatio,
-    Opt_NInit,
-    Opt_NNeighbors,
     Opt_Perplexity,
     Opt_RandomState,
     Opt_RegularizationMu,
+    Opt_RhoPcaBackground,
     Opt_Similarity,
     Opt_StandardScale,
     Opt_Verbose,
@@ -297,12 +297,12 @@ def prepare(
     max_iter: Opt_MaxIter = 300,
     eps: Opt_Eps = 1e-3,
     # ρPCA
-    ppca_background: Opt_PpcaBackground = None,
+    rhopca_background: Opt_RhoPcaBackground = None,
     nuisance: Opt_Nuisance = None,
     regularization_mu: Opt_RegularizationMu = 1e-6,
     standard_scale: Opt_StandardScale = False,
-    nuisance_ridge_alpha: Opt_NuisanceRidgeAlpha = 10.0,
-    nuisance_cross_fit: Opt_NuisanceCrossFit = 5,
+    nuisance_ridge_alpha: Opt_NuisanceRidgeAlpha = None,
+    nuisance_cross_fit: Opt_NuisanceCrossFit = 1,
     nuisance_block_normalization: Opt_NuisanceBlockNormalization = NuisanceBlockNormalization.none,
     nuisance_write_background: Opt_NuisanceWriteBackground = True,
     # Annotations
@@ -338,9 +338,9 @@ def prepare(
     if refetch_stages:
         logger.info(f"Refetching stages: {', '.join(sorted(refetch_stages))}")
 
-    if ppca_background and nuisance:
+    if rhopca_background and nuisance:
         raise typer.BadParameter(
-            "Use either --ppca-background or --nuisance for ρPCA, not both."
+            "Use either --rhopca-background or --nuisance for ρPCA, not both."
         )
 
     input_specs = _parse_input_specs(input) if input else []
@@ -523,7 +523,7 @@ def prepare(
             eps=eps,
             regularization_mu=regularization_mu,
             standard_scale=standard_scale,
-            ppca_background_path=str(ppca_background) if ppca_background else "",
+            rhopca_background_path=str(rhopca_background) if rhopca_background else "",
             nuisance_specs=tuple(nuisance or ()),
             nuisance_ridge_alpha=nuisance_ridge_alpha,
             nuisance_cross_fit=nuisance_cross_fit,

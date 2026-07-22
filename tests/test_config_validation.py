@@ -14,9 +14,22 @@ class TestConfigValidation:
         config = DimensionReductionConfig(n_components=3)
         assert config.n_components == 3
 
+    def test_n_components_k_for_prereduction(self):
+        # k>3 is allowed (ρPCA/PCA pre-reduction); the viewer 2/3-D limit is
+        # enforced at the CLI parse layer, not in the config.
+        assert DimensionReductionConfig(n_components=50).n_components == 50
+
     def test_invalid_n_components(self):
         with pytest.raises(ValueError, match="n_components"):
-            DimensionReductionConfig(n_components=5)
+            DimensionReductionConfig(n_components=1)
+
+    def test_rho_output_scale_valid(self):
+        for scale in ("none", "target_var", "unit_var"):
+            assert DimensionReductionConfig(rho_output_scale=scale).rho_output_scale == scale
+
+    def test_rho_output_scale_invalid(self):
+        with pytest.raises(ValueError, match="rho_output_scale"):
+            DimensionReductionConfig(rho_output_scale="bogus")
 
     def test_invalid_metric(self):
         with pytest.raises(ValueError, match="metric"):

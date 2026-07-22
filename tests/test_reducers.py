@@ -15,6 +15,8 @@ from protspace.utils.reducers import (
     MDSReducer,
     PaCMAPReducer,
     PCAReducer,
+    PPCAReducer,  # deprecated alias, kept for the compat test below
+    RhoPCAReducer,
     TSNEReducer,
     UMAPReducer,
 )
@@ -270,3 +272,77 @@ class TestProcessorReduction:
             assert result["dimensions"] == 2
             assert isinstance(result["name"], str)
             assert isinstance(result["info"], dict)
+
+
+# ---------------------------------------------------------------------------
+# ρPCA (contrastive) — k-D pre-reduction + output scaling
+# ---------------------------------------------------------------------------
+
+
+def _rhopca_config(n_components, rho_output_scale="none"):
+    """Build a ρPCA config with an explicit background attached as the pipeline does."""
+    rng = np.random.default_rng(SEED)
+    cfg = DimensionReductionConfig(
+        n_components=n_components,
+        regularization_mu=1e-6,
+        standard_scale=False,
+        rho_output_scale=rho_output_scale,
+    )
+    background = rng.standard_normal((N_SAMPLES, N_FEATURES))
+    object.__setattr__(cfg, "background_data", background)
+    object.__setattr__(cfg, "background_source", "explicit")
+    return cfg
+
+
+class TestRhoPCAReducer:
+    def test_two_components_default(self):
+        rng = np.random.default_rng(SEED)
+        data = rng.standard_normal((N_SAMPLES, N_FEATURES))
+        out = RhoPCAReducer(_rhopca_config(2)).fit_transform(data)
+        assert out.shape == (N_SAMPLES, 2)
+        assert np.isfinite(out).all()
+
+    @pytest.mark.parametrize("k", [3, 5, 10])
+    def test_k_dim_prereduction(self, k):
+        rng = np.random.default_rng(SEED)
+        data = rng.standard_normal((N_SAMPLES, N_FEATURES))
+        out = RhoPCAReducer(_rhopca_config(k)).fit_transform(data)
+        assert out.shape == (N_SAMPLES, k)
+        assert np.isfinite(out).all()
+
+    def test_output_scaling_modes(self):
+        rng = np.random.default_rng(SEED)
+        data = rng.standard_normal((N_SAMPLES, N_FEATURES))
+        unit = RhoPCAReducer(_rhopca_config(5, "unit_var")).fit_transform(data)
+        # unit_var standardizes every axis to ~unit variance
+        assert np.allclose(unit.std(axis=0), 1.0, atol=1e-6)
+        tvar = RhoPCAReducer(_rhopca_config(5, "target_var")).fit_transform(data)
+        assert tvar.shape == (N_SAMPLES, 5) and np.isfinite(tvar).all()
+
+    def test_rejects_one_component(self):
+        rng = np.random.default_rng(SEED)
+        data = rng.standard_normal((N_SAMPLES, N_FEATURES))
+        with pytest.raises(ValueError):
+            RhoPCAReducer(_rhopca_config(1)).fit_transform(data)
+
+    @pytest.mark.parametrize("k", [2, 25])  # 2 → subset solver, 25 → full solver (2k>d)
+    def test_eigensolve_satisfies_generalized_problem(self, k):
+        """The returned top-k eigenpairs must satisfy Σ_T v = λ(Σ_B+μI)v and be
+        ρ-descending — for both the partial (subset) and full solver branches."""
+        from protspace.utils.reducers import _sample_covariance, _solve_rho_eigenproblem
+
+        rng = np.random.default_rng(0)
+        d, mu = 30, 1e-6
+        St = _sample_covariance(rng.standard_normal((200, d)))
+        Sb = _sample_covariance(rng.standard_normal((200, d)))
+        vals, vecs = _solve_rho_eigenproblem(St, Sb, k, mu)
+        assert vals.shape == (k,) and vecs.shape == (d, k)
+        assert np.all(np.diff(vals) <= 1e-9)  # descending ρ
+        Sb_reg = Sb + mu * np.eye(d)
+        for i in range(k):
+            resid = np.linalg.norm(St @ vecs[:, i] - vals[i] * (Sb_reg @ vecs[:, i]))
+            assert resid < 1e-8
+
+    def test_ppca_reducer_alias(self):
+        # The pre-rename class name stays importable and identical (back-compat).
+        assert PPCAReducer is RhoPCAReducer
